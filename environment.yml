@@ -1,0 +1,12 @@
+name: trustopsback
+channels:
+  - conda-forge
+dependencies:
+  - python=3.12
+  - pip
+  - pip:
+      - fastapi
+      - httpx
+      - python-dotenv
+      - uvicorn[standard]
+      - langfuse>=4.0,<5.0

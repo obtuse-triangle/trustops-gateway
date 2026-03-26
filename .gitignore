@@ -1,0 +1,11 @@
+.contexty
+.env
+.env.*
+!.env.example
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+venv/
+.conda/
+.mypy_cache/
