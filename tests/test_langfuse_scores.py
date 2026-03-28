@@ -12,10 +12,7 @@ from eval.evaluator import (
     CriterionResult,
     EvalResult,
     SampleResult,
-    compute_confidence,
-    parse_judge_response,
     push_scores_to_langfuse,
-    score_from_confidence,
 )
 
 
@@ -48,7 +45,7 @@ def _make_langfuse_client() -> MagicMock:
     client = MagicMock()
     trace = MagicMock()
     trace.id = "trace-abc123"
-    client.trace.return_value = trace
+    client.start_observation.return_value = trace
     return client
 
 
@@ -92,7 +89,7 @@ class TestPushScores:
 
         push_scores_to_langfuse(eval_result, client)
 
-        assert client.trace.call_count == n
+        assert client.start_observation.call_count == n
         assert client.create_score.call_count == n * 10
 
     def test_flush_called_after_push(self) -> None:
@@ -111,6 +108,14 @@ class TestPushScores:
 
         for c in client.create_score.call_args_list:
             assert c.kwargs.get("trace_id") == "trace-abc123"
+
+    def test_langfuse_environments_are_tagged(self) -> None:
+        eval_result = _make_eval_result(n_samples=1)
+        client = _make_langfuse_client()
+
+        push_scores_to_langfuse(eval_result, client)
+
+        assert client.start_observation.call_args.kwargs["as_type"] == "evaluator"
 
 
 class TestConfidenceRange:
@@ -148,35 +153,6 @@ class TestConfidenceRange:
             assert not math.isnan(c.kwargs["value"])
             assert 0.0 <= c.kwargs["value"] <= 1.0
 
-    def test_compute_confidence_pass_dominates(self) -> None:
-        confidence = compute_confidence({"Pass": 0.0, "Fail": -float("inf")})
-        assert confidence == pytest.approx(1.0, abs=1e-9)
-
-    def test_compute_confidence_fail_dominates(self) -> None:
-        confidence = compute_confidence({"Pass": -float("inf"), "Fail": 0.0})
-        assert confidence == pytest.approx(0.0, abs=1e-9)
-
-    def test_compute_confidence_both_inf_is_nan(self) -> None:
-        confidence = compute_confidence({"Pass": -float("inf"), "Fail": -float("inf")})
-        assert math.isnan(confidence)
-
-    def test_compute_confidence_equal_logprobs(self) -> None:
-        confidence = compute_confidence({"Pass": -1.0, "Fail": -1.0})
-        assert confidence == pytest.approx(0.5, abs=1e-9)
-
-    def test_score_from_confidence_pass_high(self) -> None:
-        score = score_from_confidence(1.0, passed=True)
-        assert score == pytest.approx(5.0)
-
-    def test_score_from_confidence_fail_high(self) -> None:
-        score = score_from_confidence(1.0, passed=False)
-        assert score == pytest.approx(1.0)
-
-    def test_score_from_confidence_nan_returns_neutral(self) -> None:
-        score = score_from_confidence(float("nan"), passed=True)
-        assert score == pytest.approx(3.0)
-
-
 class TestNoLangfuse:
 
     def test_no_langfuse_skips_push(self) -> None:
@@ -188,7 +164,7 @@ class TestNoLangfuse:
             push_scores_to_langfuse(eval_result, client)
 
         client.create_score.assert_not_called()
-        client.trace.assert_not_called()
+        client.start_observation.assert_not_called()
 
     def test_cli_no_langfuse_arg_produces_no_calls(self) -> None:
         from eval.evaluator import main
@@ -235,66 +211,6 @@ class TestNoLangfuse:
         mock_push.assert_not_called()
 
 
-class TestUnexpectedToken:
-
-    def test_unexpected_token_returns_fail_with_low_confidence(self) -> None:
-        response: dict[str, Any] = {
-            "choices": [
-                {
-                    "message": {"content": "Yes"},
-                    "logprobs": {
-                        "content": [
-                            {
-                                "token": "Yes",
-                                "logprob": -0.1,
-                                "top_logprobs": [
-                                    {"token": "Yes", "logprob": -0.1},
-                                ],
-                            }
-                        ]
-                    },
-                }
-            ]
-        }
-
-        passed, confidence = parse_judge_response(response)
-
-        assert passed is False
-        assert 0.0 <= confidence <= 0.3, f"Expected low confidence ≤0.3, got {confidence}"
-
-    def test_empty_response_returns_false_zero_confidence(self) -> None:
-        passed, confidence = parse_judge_response({})
-
-        assert passed is False
-        assert confidence == 0.0
-
-    def test_pass_token_in_content_returns_passed(self) -> None:
-        response: dict[str, Any] = {
-            "choices": [
-                {
-                    "message": {"content": "Pass"},
-                    "logprobs": {
-                        "content": [
-                            {
-                                "token": "Pass",
-                                "logprob": -0.05,
-                                "top_logprobs": [
-                                    {"token": "Pass", "logprob": -0.05},
-                                    {"token": "Fail", "logprob": -3.0},
-                                ],
-                            }
-                        ]
-                    },
-                }
-            ]
-        }
-
-        passed, confidence = parse_judge_response(response)
-
-        assert passed is True
-        assert 0.5 < confidence <= 1.0
-
-
 class TestLLMReachable:
 
     async def test_llm_reachable_mock(self) -> None:
@@ -316,7 +232,7 @@ class TestIntegrationEndToEnd:
 
         push_scores_to_langfuse(eval_result, client)
 
-        trace_call = client.trace.call_args
+        trace_call = client.start_observation.call_args
         assert trace_call is not None
         assert "eval-sample_0" in trace_call.kwargs.get("name", "")
 
@@ -334,7 +250,7 @@ class TestIntegrationEndToEnd:
 
         push_scores_to_langfuse(eval_result, client)
 
-        trace_call = client.trace.call_args
+        trace_call = client.start_observation.call_args
         trace_input = trace_call.kwargs.get("input", {})
         assert "question" in trace_input
         assert trace_input["question"] == "What is K3s?"

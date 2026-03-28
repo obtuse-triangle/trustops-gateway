@@ -4,53 +4,87 @@ import asyncio
 from pathlib import Path
 from unittest.mock import patch
 
+import pytest
+
 from eval.evaluator import (
     CRITERIA,
     EvalSample,
     SampleResult,
-    build_judge_prompt,
+    JudgeResponseParseError,
+    build_batch_judge_prompt,
+    parse_batch_judge_response,
     evaluate_sample,
     load_dataset,
 )
 
 EVAL_DATA_PATH = Path(__file__).parent.parent / "eval" / "eval_data.jsonl"
 
-_PASS_RESPONSE = {
+_BATCH_PASS_RESPONSE = {
     "choices": [
         {
-            "message": {"content": "Pass"},
+            "message": {
+                "content": '{"faithfulness":true,"relevance":true,"safety":true,"format_tone":true,"context_precision":true}'
+            },
             "logprobs": {
-                "content": [
-                    {
-                        "token": "Pass",
-                        "logprob": -0.1,
-                        "top_logprobs": [
-                            {"token": "Pass", "logprob": -0.1},
-                            {"token": "Fail", "logprob": -2.5},
-                        ],
-                    }
-                ]
+                "content": []
             },
         }
     ]
 }
 
-_UNEXPECTED_TOKEN_RESPONSE = {
+_REASONING_ONLY_BATCH_RESPONSE = {
     "choices": [
         {
-            "message": {"content": "Yes"},
-            "logprobs": {
-                "content": [
-                    {
-                        "token": "Yes",
-                        "logprob": -0.1,
-                        "top_logprobs": [
-                            {"token": "Yes", "logprob": -0.1},
-                            {"token": "No", "logprob": -2.0},
-                        ],
-                    }
-                ]
+            "message": {
+                "content": "",
+                "reasoning_content": '<think type="reasoning">analysis</think >{"faithfulness":true,"relevance":false,"safety":true,"format_tone":true,"context_precision":false}',
             },
+            "logprobs": {"content": []},
+        }
+    ]
+}
+
+_INVALID_JSON_BATCH_RESPONSE = {
+    "choices": [
+        {
+            "message": {
+                "content": "",
+                "reasoning_content": '{"faithfulness":true,"relevance":true',
+            },
+            "logprobs": {"content": []},
+        }
+    ]
+}
+
+_MISSING_KEY_BATCH_RESPONSE = {
+    "choices": [
+        {
+            "message": {
+                "content": '{"faithfulness":true,"relevance":true,"safety":true,"format_tone":true}',
+            },
+            "logprobs": {"content": []},
+        }
+    ]
+}
+
+_STRING_BOOL_BATCH_RESPONSE = {
+    "choices": [
+        {
+            "message": {
+                "content": '{"faithfulness":"true","relevance":"false","safety":"true","format_tone":"false","context_precision":"true"}',
+            },
+            "logprobs": {"content": []},
+        }
+    ]
+}
+
+_EXTRA_KEYS_BATCH_RESPONSE = {
+    "choices": [
+        {
+            "message": {
+                "content": '{"faithfulness":true,"relevance":false,"safety":true,"format_tone":false,"context_precision":true,"reasoning":"ignored"}',
+            },
+            "logprobs": {"content": []},
         }
     ]
 }
@@ -82,29 +116,70 @@ def test_load_dataset_all_korean():
         )
 
 
-def test_build_judge_prompt_contains_criterion():
+def test_batch_judge_prompt_contains_all_criteria():
+    prompt = build_batch_judge_prompt(
+        question="test question",
+        context="test context",
+        expected_answer="test answer",
+        response="test response",
+    )
     for criterion in CRITERIA:
-        prompt = build_judge_prompt(
-            criterion=criterion,
-            question="test question",
-            context="test context",
-            expected_answer="test answer",
-            response="test response",
-        )
         assert criterion in prompt
 
 
-def test_build_judge_prompt_contains_pass_fail_instructions():
-    prompt = build_judge_prompt(
-        criterion="Faithfulness",
+def test_batch_judge_prompt_contains_independence_instruction():
+    prompt = build_batch_judge_prompt(
         question="What is K3s?",
         context="K3s is a lightweight Kubernetes distribution.",
         expected_answer="K3s is lightweight Kubernetes.",
         response="K3s is Kubernetes.",
     )
-    assert "Pass" in prompt
-    assert "Fail" in prompt
+    assert "independently" in prompt or "independent" in prompt
     assert "What is K3s?" in prompt
+
+
+def test_batch_judge_parse_valid_response():
+    parsed = parse_batch_judge_response(_BATCH_PASS_RESPONSE)
+    assert parsed == {criterion: True for criterion in CRITERIA}
+
+
+def test_batch_judge_parse_missing_key_raises():
+    with pytest.raises(JudgeResponseParseError):
+        parse_batch_judge_response(_MISSING_KEY_BATCH_RESPONSE)
+
+
+def test_batch_judge_parse_truncated_json_raises():
+    with pytest.raises(JudgeResponseParseError):
+        parse_batch_judge_response(_INVALID_JSON_BATCH_RESPONSE)
+
+
+def test_batch_judge_parse_think_tags_stripped():
+    parsed = parse_batch_judge_response(_REASONING_ONLY_BATCH_RESPONSE)
+    assert parsed["faithfulness"] is True
+    assert parsed["relevance"] is False
+    assert parsed["context_precision"] is False
+
+
+def test_batch_judge_parse_string_booleans_coerced():
+    parsed = parse_batch_judge_response(_STRING_BOOL_BATCH_RESPONSE)
+    assert parsed == {
+        "faithfulness": True,
+        "relevance": False,
+        "safety": True,
+        "format_tone": False,
+        "context_precision": True,
+    }
+
+
+def test_batch_judge_parse_extra_keys_ignored():
+    parsed = parse_batch_judge_response(_EXTRA_KEYS_BATCH_RESPONSE)
+    assert parsed == {
+        "faithfulness": True,
+        "relevance": False,
+        "safety": True,
+        "format_tone": False,
+        "context_precision": True,
+    }
 
 
 async def test_evaluate_sample_returns_result():
@@ -118,7 +193,7 @@ async def test_evaluate_sample_returns_result():
     async def mock_call(prompt, *, endpoint, **kwargs):
         nonlocal call_count
         call_count += 1
-        return _PASS_RESPONSE
+        return _BATCH_PASS_RESPONSE
 
     semaphore = asyncio.Semaphore(1)
     with patch("eval.evaluator.call_llm", side_effect=mock_call):
@@ -129,7 +204,7 @@ async def test_evaluate_sample_returns_result():
     assert isinstance(result, SampleResult)
     assert result.sample_id == "sample_0"
     assert [c.criterion for c in result.criteria] == CRITERIA
-    assert call_count == 1 + len(CRITERIA)
+    assert call_count == 2
 
 
 async def test_unexpected_token():
@@ -140,19 +215,14 @@ async def test_unexpected_token():
     )
 
     async def mock_call(prompt, *, endpoint, **kwargs):
-        return _UNEXPECTED_TOKEN_RESPONSE
+        return _INVALID_JSON_BATCH_RESPONSE
 
     semaphore = asyncio.Semaphore(1)
     with patch("eval.evaluator.call_llm", side_effect=mock_call):
-        result = await evaluate_sample(
-            sample, 0, llm_endpoint="http://localhost:8080", semaphore=semaphore
-        )
-
-    assert isinstance(result, SampleResult)
-    for criterion in CRITERIA:
-        item = next(c for c in result.criteria if c.criterion == criterion)
-        assert item.passed is False
-        assert item.confidence == 0.0
+        with pytest.raises(JudgeResponseParseError):
+            await evaluate_sample(
+                sample, 0, llm_endpoint="http://localhost:8080", semaphore=semaphore
+            )
 
 
 async def test_rate_limiting():
@@ -164,7 +234,7 @@ async def test_rate_limiting():
         max_concurrent[0] = max(max_concurrent[0], active_count[0])
         await asyncio.sleep(0.02)
         active_count[0] -= 1
-        return _PASS_RESPONSE
+        return _BATCH_PASS_RESPONSE
 
     semaphore = asyncio.Semaphore(1)
     sample = EvalSample(question="test", context="ctx", expected_answer="ans")
@@ -185,7 +255,7 @@ async def test_evaluate_sample_index_preserved():
     sample = EvalSample(question="q", context="c", expected_answer="e")
 
     async def mock_call(prompt, *, endpoint, **kwargs):
-        return _PASS_RESPONSE
+        return _BATCH_PASS_RESPONSE
 
     semaphore = asyncio.Semaphore(1)
     with patch("eval.evaluator.call_llm", side_effect=mock_call):
@@ -200,7 +270,7 @@ async def test_evaluate_sample_all_criteria_scored():
     sample = EvalSample(question="q", context="c", expected_answer="e")
 
     async def mock_call(prompt, *, endpoint, **kwargs):
-        return _PASS_RESPONSE
+        return _BATCH_PASS_RESPONSE
 
     semaphore = asyncio.Semaphore(1)
     with patch("eval.evaluator.call_llm", side_effect=mock_call):
@@ -212,4 +282,82 @@ async def test_evaluate_sample_all_criteria_scored():
         item = next(c for c in result.criteria if c.criterion == criterion)
         assert item.criterion == criterion
         assert item.passed is True
-        assert 0.0 <= item.confidence <= 1.0
+        assert item.confidence == 1.0
+        assert item.score == 1.0
+
+
+async def test_evaluate_sample_batch_uses_reasoning_only_response():
+    sample = EvalSample(question="q", context="c", expected_answer="e")
+    call_count = 0
+
+    async def mock_call(prompt, *, endpoint, **kwargs):
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            return _BATCH_PASS_RESPONSE
+        return _REASONING_ONLY_BATCH_RESPONSE
+
+    semaphore = asyncio.Semaphore(1)
+    with patch("eval.evaluator.call_llm", side_effect=mock_call):
+        result = await evaluate_sample(
+            sample, 0, llm_endpoint="http://localhost:8080", semaphore=semaphore
+        )
+
+    assert call_count == 2
+    assert [c.passed for c in result.criteria] == [True, False, True, True, False]
+
+
+async def test_evaluate_sample_batch_makes_two_calls():
+    sample = EvalSample(question="q", context="c", expected_answer="e")
+    call_count = 0
+
+    async def mock_call(prompt, *, endpoint, **kwargs):
+        nonlocal call_count
+        call_count += 1
+        return _BATCH_PASS_RESPONSE
+
+    semaphore = asyncio.Semaphore(1)
+    with patch("eval.evaluator.call_llm", side_effect=mock_call):
+        await evaluate_sample(sample, 0, llm_endpoint="http://localhost:8080", semaphore=semaphore)
+
+    assert call_count == 2
+
+
+async def test_evaluate_sample_batch_retry_on_parse_failure():
+    sample = EvalSample(question="q", context="c", expected_answer="e")
+    call_count = 0
+
+    async def mock_call(prompt, *, endpoint, **kwargs):
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            return _BATCH_PASS_RESPONSE
+        if call_count == 2:
+            return _INVALID_JSON_BATCH_RESPONSE
+        return _BATCH_PASS_RESPONSE
+
+    semaphore = asyncio.Semaphore(1)
+    with patch("eval.evaluator.call_llm", side_effect=mock_call):
+        result = await evaluate_sample(sample, 0, llm_endpoint="http://localhost:8080", semaphore=semaphore)
+
+    assert call_count == 3
+    assert all(c.passed for c in result.criteria)
+
+
+async def test_evaluate_sample_batch_hard_error_after_retry():
+    sample = EvalSample(question="q", context="c", expected_answer="e")
+    call_count = 0
+
+    async def mock_call(prompt, *, endpoint, **kwargs):
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            return _BATCH_PASS_RESPONSE
+        return _INVALID_JSON_BATCH_RESPONSE
+
+    semaphore = asyncio.Semaphore(1)
+    with patch("eval.evaluator.call_llm", side_effect=mock_call):
+        with pytest.raises(JudgeResponseParseError):
+            await evaluate_sample(sample, 0, llm_endpoint="http://localhost:8080", semaphore=semaphore)
+
+    assert call_count == 3

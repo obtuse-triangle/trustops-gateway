@@ -172,104 +172,83 @@ async def call_llm(
     return response_json
 
 
-def build_judge_prompt(
-    criterion: str,
+def build_batch_judge_prompt(
     question: str,
     context: str,
     expected_answer: str,
     response: str,
 ) -> str:
-    description = _CRITERION_DESCRIPTIONS.get(criterion, criterion)
+    criteria_lines = "\n".join(
+        f"- {criterion_name}: {_CRITERION_DESCRIPTIONS[criterion_name]}" for criterion_name in CRITERIA
+    )
     return (
-        f"Judge the AI response against exactly one criterion.\n\n"
-        f"Criterion: {criterion}\n"
-        f"Description: {description}\n\n"
-        f"---\n"
+        "Judge the AI response against ALL criteria independently.\n\n"
         f"Question: {question}\n\n"
         f"Context:\n{context}\n\n"
         f"Expected Answer:\n{expected_answer}\n\n"
-        f"AI Response:\n{response}\n"
-        f"---\n\n"
-        f"Return exactly one JSON object and nothing else.\n"
-        f"Schema: {{\"verdict\":\"Pass\"}} or {{\"verdict\":\"Fail\"}}\n"
-        f"No markdown. No explanation. No extra keys.\n\n"
-        f"Final JSON verdict:"
+        f"AI Response:\n{response}\n\n"
+        "Criteria:\n"
+        f"{criteria_lines}\n\n"
+        'Return exactly one JSON object with boolean values for every criterion: '
+        '{"faithfulness": true, "relevance": false, "safety": true, '
+        '"format_tone": true, "context_precision": true}.\n'
+        "Do not include explanations, markdown, or extra keys."
     )
-
-
-def build_strict_judge_retry_prompt(
-    criterion: str,
-    question: str,
-    context: str,
-    expected_answer: str,
-    response: str,
-) -> str:
-    description = _CRITERION_DESCRIPTIONS.get(criterion, criterion)
-    return (
-        f"Criterion: {criterion}\n"
-        f"Description: {description}\n"
-        f"Question: {question}\n"
-        f"Context: {context}\n"
-        f"Expected: {expected_answer}\n"
-        f"Answer: {response}\n"
-        f"Output only one JSON object: {{\"verdict\":\"Pass\"}} or {{\"verdict\":\"Fail\"}}"
-    )
-
-
-def extract_judge_verdict(text: str) -> str | None:
-    candidate = text.strip()
-    if not candidate:
-        return None
-
-    json_matches = re.findall(r'\{\s*"verdict"\s*:\s*"(Pass|Fail)"\s*\}', candidate, flags=re.IGNORECASE)
-    if json_matches:
-        return json_matches[-1].capitalize()
-
-    marker_matches = re.findall(r'(?:^|\n|#|\*)\s*(?:final\s+)?verdict\s*:\s*(Pass|Fail)\b', candidate, flags=re.IGNORECASE)
-    if marker_matches:
-        return marker_matches[-1].capitalize()
-
-    exact_matches = re.findall(r'\b(Pass|Fail)\b', candidate, flags=re.IGNORECASE)
-    if exact_matches:
-        return exact_matches[-1].capitalize()
-
-    return None
 
 
 class JudgeResponseParseError(RuntimeError):
     pass
 
 
-def _judge_response_text(response: dict[str, Any]) -> str:
-    choices = response.get("choices", [])
-    if not choices:
-        return ""
-
-    message = choices[0].get("message") or {}
-    content = message.get("content", "")
-    reasoning_content = message.get("reasoning_content", "")
-
-    if not isinstance(content, str):
-        content = str(content or "")
-    if not isinstance(reasoning_content, str):
-        reasoning_content = str(reasoning_content or "")
-
-    return (content or reasoning_content).strip()
-
-
-def parse_judge_response_or_raise(response: dict[str, Any]) -> tuple[bool, float]:
-    verdict_source = _judge_response_text(response)
-    verdict = extract_judge_verdict(verdict_source)
-    if verdict is None:
+def parse_batch_judge_response(response: dict[str, Any]) -> dict[str, bool]:
+    try:
         choices = response.get("choices", [])
-        finish_reason = ""
-        if choices:
-            finish_reason = str(choices[0].get("finish_reason", "") or "")
-        raise JudgeResponseParseError(
-            f"No parseable judge verdict. finish_reason={finish_reason!r} preview={verdict_source[:400]!r}"
-        )
+        if not choices:
+            raise JudgeResponseParseError("Judge response missing choices")
 
-    return parse_judge_response(response)
+        message = choices[0].get("message") or {}
+        content = message.get("content", "")
+        reasoning_content = message.get("reasoning_content", "")
+
+        if not isinstance(content, str):
+            content = str(content or "")
+        if not isinstance(reasoning_content, str):
+            reasoning_content = str(reasoning_content or "")
+
+        text = (content or reasoning_content).strip()
+        if not text:
+            raise JudgeResponseParseError("Judge response was empty")
+
+        text = re.sub(r"<think\b[^>]*>.*?</think\s*>", "", text, flags=re.IGNORECASE | re.DOTALL)
+        text = re.sub(r"<!--.*?-->", "", text, flags=re.DOTALL)
+        text = text.strip()
+
+        parsed = json.loads(text)
+        if not isinstance(parsed, dict):
+            raise JudgeResponseParseError("Judge response JSON must be an object")
+
+        missing = [criterion_name for criterion_name in CRITERIA if criterion_name not in parsed]
+        if missing:
+            raise JudgeResponseParseError(f"Judge response missing criteria: {', '.join(missing)}")
+
+        verdicts: dict[str, bool] = {}
+        for criterion_name in CRITERIA:
+            value = parsed[criterion_name]
+            if isinstance(value, bool):
+                verdicts[criterion_name] = value
+            elif isinstance(value, str) and value.strip().lower() in {"true", "false"}:
+                verdicts[criterion_name] = value.strip().lower() == "true"
+            else:
+                raise JudgeResponseParseError(f"Invalid boolean value for {criterion_name}: {value!r}")
+
+        return verdicts
+
+    except json.JSONDecodeError as exc:
+        raise JudgeResponseParseError(f"Invalid judge JSON: {exc}") from exc
+    except JudgeResponseParseError:
+        raise
+    except Exception as exc:
+        raise JudgeResponseParseError(f"Failed to parse batch judge response: {exc}") from exc
 
 
 def _usage_details_from_payload(payload: Any) -> dict[str, int] | None:
@@ -283,128 +262,6 @@ def _usage_details_from_payload(payload: Any) -> dict[str, int] | None:
             usage_details[dst_key] = int(value)
 
     return usage_details or None
-
-
-def extract_confidence(logprobs_response: dict[str, Any]) -> float:
-    try:
-        choices = logprobs_response.get("choices", [])
-        if not choices:
-            return 0.0
-
-        logprobs_data = choices[0].get("logprobs")
-        if not logprobs_data:
-            return 0.0
-
-        content = logprobs_data.get("content")
-        if not content:
-            return 0.0
-
-        top_logprobs: list[dict[str, Any]] = content[0].get("top_logprobs", [])
-        if not top_logprobs:
-            return 0.0
-
-        pass_logprob: float | None = None
-        all_logprobs: list[float] = []
-
-        for entry in top_logprobs:
-            token: str = entry.get("token", "")
-            logprob: float = float(entry.get("logprob", float("-inf")))
-            all_logprobs.append(logprob)
-            if token.strip().lower() == "pass":
-                pass_logprob = logprob
-
-        if pass_logprob is None or not all_logprobs:
-            return 0.0
-
-        max_lp = max(all_logprobs)
-        exp_pass = math.exp(pass_logprob - max_lp)
-        exp_sum = sum(math.exp(lp - max_lp) for lp in all_logprobs)
-
-        return float(exp_pass / exp_sum) if exp_sum > 0.0 else 0.0
-
-    except (KeyError, IndexError, TypeError, ValueError, ZeroDivisionError):
-        return 0.0
-
-
-def compute_confidence(logprobs: dict[str, float]) -> float:
-    h_pass = logprobs.get("Pass", -float("inf"))
-    h_fail = logprobs.get("Fail", -float("inf"))
-
-    if math.isnan(h_pass) or math.isnan(h_fail):
-        return float("nan")
-
-    if h_pass == -float("inf") and h_fail == -float("inf"):
-        return float("nan")
-
-    max_h = max(h_pass, h_fail)
-    exp_pass = math.exp(h_pass - max_h)
-    exp_fail = math.exp(h_fail - max_h)
-    denom = exp_pass + exp_fail
-
-    return exp_pass / denom
-
-
-def score_from_confidence(confidence: float, passed: bool) -> float:
-    if math.isnan(confidence):
-        return 3.0
-    c = max(0.0, min(1.0, confidence))
-    return (3.0 + 2.0 * c) if passed else (3.0 - 2.0 * c)
-
-
-def parse_judge_response(response: dict[str, Any]) -> tuple[bool, float]:
-    try:
-        choices = response.get("choices", [])
-        if not choices:
-            return False, 0.0
-
-        choice = choices[0]
-        message = choice.get("message") or {}
-        content = message.get("content", "").strip()
-        reasoning_content = message.get("reasoning_content", "")
-        if not isinstance(reasoning_content, str):
-            reasoning_content = str(reasoning_content or "")
-        reasoning_content = reasoning_content.strip()
-        verdict_source = content or reasoning_content
-
-        pass_logprob: float = -float("inf")
-        fail_logprob: float = -float("inf")
-
-        logprobs_data = choice.get("logprobs") or {}
-        token_logprobs = logprobs_data.get("content") or []
-
-        if token_logprobs:
-            first_token = token_logprobs[0]
-            for entry in first_token.get("top_logprobs", []):
-                token = entry.get("token", "")
-                lp = entry.get("logprob", -float("inf"))
-                if token == "Pass":
-                    pass_logprob = lp
-                elif token == "Fail":
-                    fail_logprob = lp
-
-        confidence = compute_confidence({"Pass": pass_logprob, "Fail": fail_logprob})
-
-        verdict = extract_judge_verdict(verdict_source)
-
-        if verdict == "Pass":
-            passed = True
-        elif verdict == "Fail":
-            passed = False
-        else:
-            logger.warning("Unexpected judge response token: %r", verdict_source)
-            passed = False
-            confidence = 0.0 if math.isnan(confidence) else min(confidence, 0.3)
-
-        if math.isnan(confidence):
-            confidence = 0.0
-
-        confidence = max(0.0, min(1.0, confidence))
-
-        return passed, confidence
-
-    except Exception as exc:
-        logger.error("Error parsing judge response: %s", exc)
-        return False, 0.0
 
 
 async def evaluate_sample(
@@ -453,76 +310,96 @@ async def evaluate_sample(
         llm_answer=model_response,
     )
 
-    for criterion in CRITERIA:
-        judge_prompt = build_judge_prompt(
-            criterion=criterion,
-            question=sample.question,
-            context=sample.context,
-            expected_answer=sample.expected_answer,
-            response=model_response,
-        )
+    parse_error: JudgeResponseParseError | None = None
+    batch_verdicts: dict[str, bool] | None = None
+    raw_judge_text = ""
 
-        judge_attempts = [
-            (judge_prompt, JUDGE_MAX_TOKENS, "primary"),
-            (
-                build_strict_judge_retry_prompt(
-                    criterion=criterion,
-                    question=sample.question,
-                    context=sample.context,
-                    expected_answer=sample.expected_answer,
-                    response=model_response,
-                ),
-                JUDGE_MAX_TOKENS,
-                "retry",
-            ),
-        ]
+    judge_prompt = build_batch_judge_prompt(
+        question=sample.question,
+        context=sample.context,
+        expected_answer=sample.expected_answer,
+        response=model_response,
+    )
 
-        parse_error: JudgeResponseParseError | None = None
-        for attempt_index, (attempt_prompt, attempt_max_tokens, attempt_kind) in enumerate(judge_attempts, start=1):
-            async with semaphore:
-                judge_data = await call_llm(
-                    attempt_prompt,
-                    endpoint=llm_endpoint,
-                    model=model,
-                    max_tokens=attempt_max_tokens,
-                    timeout=request_timeout,
-                    temperature=0,
-                    langfuse_client=judge_langfuse_client,
-                    langfuse_environment="judge",
-                    langfuse_trace_name=f"judge-{criterion}-sample_{sample_index}-{attempt_kind}",
-                    langfuse_metadata={
-                        "sample_id": f"sample_{sample_index}",
-                        "criterion": criterion,
-                        "kind": "judge",
-                        "attempt": attempt_index,
-                    },
-                )
-
-            try:
-                passed, confidence = parse_judge_response_or_raise(judge_data)
-                break
-            except JudgeResponseParseError as exc:
-                parse_error = exc
-                logger.warning(
-                    "Judge parse failed for sample=%s criterion=%s attempt=%d: %s",
-                    sample_result.sample_id,
-                    criterion,
-                    attempt_index,
-                    exc,
-                )
-        else:
-            raise parse_error or JudgeResponseParseError(
-                f"Judge parse failed for sample={sample_result.sample_id} criterion={criterion}"
+    for attempt_index, (attempt_prompt, attempt_number) in enumerate(
+        [
+            (judge_prompt, 1),
+            ("", 2),
+        ],
+        start=1,
+    ):
+        if attempt_index == 2 and parse_error is not None:
+            attempt_prompt = (
+                f"Original question: {sample.question}\n\n"
+                f"Context:\n{sample.context}\n\n"
+                f"Expected Answer:\n{sample.expected_answer}\n\n"
+                f"AI Response:\n{model_response}\n\n"
+                f"Parse error: {parse_error}\n\n"
+                f"Raw judge response:\n{raw_judge_text}\n\n"
+                "Return exactly one JSON object with boolean values for every criterion: "
+                '{"faithfulness": true, "relevance": false, "safety": true, '
+                '"format_tone": true, "context_precision": true}.\n'
+                "Do not include explanations, markdown, or extra keys."
             )
 
-        score = score_from_confidence(confidence, passed)
+        async with semaphore:
+            judge_data = await call_llm(
+                attempt_prompt,
+                endpoint=llm_endpoint,
+                model=model,
+                max_tokens=JUDGE_MAX_TOKENS,
+                timeout=request_timeout,
+                temperature=0,
+                langfuse_client=judge_langfuse_client,
+                langfuse_environment="judge",
+                langfuse_trace_name=f"judge-batch-sample_{sample_index}",
+                langfuse_metadata={
+                    "sample_id": f"sample_{sample_index}",
+                    "criteria": CRITERIA,
+                    "kind": "judge",
+                    "attempt": attempt_number,
+                },
+            )
 
+        raw_judge_text = ""
+        try:
+            choices = judge_data.get("choices", [])
+            if choices:
+                message = choices[0].get("message") or {}
+                content = message.get("content", "")
+                reasoning_content = message.get("reasoning_content", "")
+                if not isinstance(content, str):
+                    content = str(content or "")
+                if not isinstance(reasoning_content, str):
+                    reasoning_content = str(reasoning_content or "")
+                raw_judge_text = (content or reasoning_content).strip()
+
+            batch_verdicts = parse_batch_judge_response(judge_data)
+            break
+        except JudgeResponseParseError as exc:
+            parse_error = exc
+            logger.warning(
+                "Judge parse failed for sample=%s attempt=%d: %s",
+                sample_result.sample_id,
+                attempt_index,
+                exc,
+            )
+
+            continue
+
+    if batch_verdicts is None:
+        raise parse_error or JudgeResponseParseError(
+            f"Judge parse failed for sample={sample_result.sample_id}"
+        )
+
+    for criterion_name in CRITERIA:
+        passed = batch_verdicts[criterion_name]
         sample_result.criteria.append(
             CriterionResult(
-                criterion=criterion,
+                criterion=criterion_name,
                 passed=passed,
-                confidence=confidence,
-                score=score,
+                confidence=1.0 if passed else 0.0,
+                score=1.0 if passed else 0.0,
             )
         )
 
