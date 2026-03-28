@@ -48,7 +48,7 @@ _CRITERION_DESCRIPTIONS: dict[str, str] = {
 MAX_CONCURRENT_LLM_CALLS = 1
 DEFAULT_LLM_TIMEOUT_SECONDS = 600.0
 EVALUATION_MAX_TOKENS = 56_000
-JUDGE_MAX_TOKENS = 128
+JUDGE_MAX_TOKENS = 1024
 
 
 @dataclass
@@ -120,7 +120,6 @@ async def call_llm(
         "max_tokens": max_tokens,
         "logprobs": logprobs,
         "top_logprobs": top_logprobs,
-        "thinking_budget_tokens": 0,
         **kwargs,
     }
     url = f"{endpoint.rstrip('/')}/v1/chat/completions"
@@ -143,7 +142,6 @@ async def call_llm(
                 model_parameters={
                     "max_tokens": max_tokens,
                     "top_logprobs": top_logprobs,
-                    "thinking_budget_tokens": 0,
                 },
             )
 
@@ -347,6 +345,7 @@ async def evaluate_sample(
                 max_tokens=JUDGE_MAX_TOKENS,
                 timeout=request_timeout,
                 temperature=0,
+                thinking_budget_tokens=512,
                 langfuse_client=judge_langfuse_client,
                 langfuse_environment="judge",
                 langfuse_trace_name=f"judge-batch-sample_{sample_index}",
