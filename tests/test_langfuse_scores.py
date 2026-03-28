@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import math
 import sys
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -27,8 +26,8 @@ def _make_sample_result(sample_id: str = "sample_0") -> SampleResult:
             CriterionResult(
                 criterion=c,
                 passed=True,
-                confidence=0.9,
-                score=4.8,
+                confidence=1.0,
+                score=1.0,
             )
             for c in CRITERIA
         ],
@@ -57,7 +56,7 @@ class TestPushScores:
 
         push_scores_to_langfuse(eval_result, client)
 
-        assert client.create_score.call_count == 10
+        assert client.create_score.call_count == 5
 
     def test_score_names_match_criteria_exactly(self) -> None:
         eval_result = _make_eval_result(n_samples=1)
@@ -66,10 +65,7 @@ class TestPushScores:
         push_scores_to_langfuse(eval_result, client)
 
         names = [c.kwargs["name"] for c in client.create_score.call_args_list]
-        expected_names = []
-        for criterion in CRITERIA:
-            expected_names.append(criterion)
-            expected_names.append(f"{criterion}_confidence")
+        expected_names = list(CRITERIA)
 
         assert names == expected_names
 
@@ -90,7 +86,7 @@ class TestPushScores:
         push_scores_to_langfuse(eval_result, client)
 
         assert client.start_observation.call_count == n
-        assert client.create_score.call_count == n * 10
+        assert client.create_score.call_count == n * 5
 
     def test_flush_called_after_push(self) -> None:
         eval_result = _make_eval_result()
@@ -116,43 +112,6 @@ class TestPushScores:
         push_scores_to_langfuse(eval_result, client)
 
         assert client.start_observation.call_args.kwargs["as_type"] == "evaluator"
-
-
-class TestConfidenceRange:
-
-    def test_confidence_values_in_valid_range(self) -> None:
-        eval_result = _make_eval_result(n_samples=1)
-        edge_values = [0.0, 0.5, 1.0, 0.99, 0.01]
-        for i, cr in enumerate(eval_result.samples[0].criteria):
-            cr.confidence = edge_values[i]
-
-        client = _make_langfuse_client()
-        push_scores_to_langfuse(eval_result, client)
-
-        confidence_calls = [
-            c for c in client.create_score.call_args_list
-            if c.kwargs["name"].endswith("_confidence")
-        ]
-        for c in confidence_calls:
-            value = c.kwargs["value"]
-            assert 0.0 <= value <= 1.0, f"Confidence {value} out of range for {c.kwargs['name']}"
-
-    def test_nan_confidence_clamped_to_zero(self) -> None:
-        eval_result = _make_eval_result(n_samples=1)
-        for cr in eval_result.samples[0].criteria:
-            cr.confidence = float("nan")
-
-        client = _make_langfuse_client()
-        push_scores_to_langfuse(eval_result, client)
-
-        confidence_calls = [
-            c for c in client.create_score.call_args_list
-            if c.kwargs["name"].endswith("_confidence")
-        ]
-        for c in confidence_calls:
-            assert not math.isnan(c.kwargs["value"])
-            assert 0.0 <= c.kwargs["value"] <= 1.0
-
 class TestNoLangfuse:
 
     def test_no_langfuse_skips_push(self) -> None:
@@ -242,7 +201,7 @@ class TestIntegrationEndToEnd:
 
         push_scores_to_langfuse(eval_result, client)
 
-        assert client.create_score.call_count == 20
+        assert client.create_score.call_count == 10
 
     def test_integration_trace_input_has_question(self) -> None:
         eval_result = _make_eval_result(n_samples=1)

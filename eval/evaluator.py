@@ -4,7 +4,6 @@ import argparse
 import asyncio
 import json
 import logging
-import math
 import os
 import re
 import sys
@@ -507,16 +506,6 @@ def push_scores_to_langfuse(
                 trace_id=trace_id,
                 name=cr.criterion,
                 value=cr.score,
-                data_type="NUMERIC",
-            )
-
-            confidence_value = 0.0 if math.isnan(cr.confidence) else cr.confidence
-            confidence_value = max(0.0, min(1.0, confidence_value))
-
-            evaluation_langfuse_client.create_score(
-                trace_id=trace_id,
-                name=f"{cr.criterion}_confidence",
-                value=confidence_value,
                 data_type="NUMERIC",
             )
 
