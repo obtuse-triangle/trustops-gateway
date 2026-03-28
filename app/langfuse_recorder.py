@@ -152,7 +152,6 @@ class LangfuseRecorder:
 
     # prompt_tokens_details keys get "input_" prefix (e.g. cached_tokens → input_cached_tokens)
     prompt_tokens_details = usage.get("prompt_tokens_details")
-    print("prompt_tokens_details:", prompt_tokens_details)
     if isinstance(prompt_tokens_details, Mapping):
       for key, value in prompt_tokens_details.items():
         if isinstance(value, bool):
