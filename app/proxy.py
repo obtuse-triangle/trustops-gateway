@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import random
 import sys
 import time
 from typing import Any
@@ -13,6 +14,7 @@ from fastapi import HTTPException, Request, Response
 from fastapi.responses import StreamingResponse
 
 from app.langfuse_recorder import LangfuseRecorder
+from app.prompt_manager import PromptManager
 from app.settings import Settings
 
 logger = logging.getLogger("trustopsback")
@@ -92,6 +94,7 @@ async def proxy_request(
     client: httpx.AsyncClient,
     settings: Settings,
     langfuse: LangfuseRecorder | None,
+    prompt_manager: PromptManager | None = None,
 ) -> Response:
   upstream_url = build_upstream_url(settings.vllm_base_url, path)
   body = await read_request_body(request, settings)
@@ -105,6 +108,28 @@ async def proxy_request(
   except Exception:
     request_json = None
   trace_identity = extract_trace_identity(request, request_json)
+
+  version_tag: str | None = None
+  if (
+      prompt_manager is not None
+      and isinstance(request_json, dict)
+      and isinstance(request_json.get("messages"), list)
+  ):
+    _roll = random.random()
+    _prompt_text, version_tag = prompt_manager.get_prompt(_roll)
+    if _prompt_text:
+      _msgs = list(request_json["messages"])
+      if _msgs and isinstance(_msgs[0], dict) and _msgs[0].get("role") == "system":
+        _msgs[0] = {**_msgs[0], "content": _prompt_text}
+      else:
+        _msgs.insert(0, {"role": "system", "content": _prompt_text})
+      request_json = {**request_json, "messages": _msgs}
+      try:
+        body = json.dumps(request_json).encode("utf-8")
+        if "content-type" not in {k.lower() for k in headers}:
+          headers["content-type"] = "application/json"
+      except Exception:
+        pass
 
   is_streaming_request = bool(isinstance(
     request_json, dict) and request_json.get("stream"))
@@ -199,6 +224,7 @@ async def proxy_request(
                   start_time_perf=start,
                   user_id=trace_identity["user_id"],
                   session_id=trace_identity["session_id"],
+                  prompt_version=version_tag,
               ),
           )
         # Pass real exc_info so httpx can properly clean up the connection
@@ -246,6 +272,7 @@ async def proxy_request(
         start_time_perf=start,
         user_id=trace_identity["user_id"],
         session_id=trace_identity["session_id"],
+        prompt_version=version_tag,
     )
 
   if response_error is not None:

@@ -4,7 +4,6 @@ import json
 import logging
 import re
 import time as _time
-from datetime import datetime, timezone
 from collections.abc import Mapping
 from typing import Any
 
@@ -79,6 +78,7 @@ class LangfuseRecorder:
       status_code: int | None = None,
       duration_ms: float | None = None,
       stream: bool,
+      prompt_version: str | None = None,
   ) -> dict[str, str]:
     metadata = {
         "path": path,
@@ -96,6 +96,8 @@ class LangfuseRecorder:
       messages = request_payload.get("messages")
       if isinstance(messages, list):
         metadata["message_count"] = str(len(messages))
+    if prompt_version is not None:
+      metadata["prompt_version"] = prompt_version
     return metadata
 
   def _extract_model_parameters(self, request_payload: Any) -> dict[str, Any]:
@@ -469,6 +471,7 @@ class LangfuseRecorder:
       stream: bool = False,
       user_id: str | None = None,
       session_id: str | None = None,
+      prompt_version: str | None = None,
   ) -> None:
     if self.client is None:
       return
@@ -493,6 +496,7 @@ class LangfuseRecorder:
             status_code=status_code,
             duration_ms=duration_ms,
             stream=stream,
+            prompt_version=prompt_version,
         ),
     }
     model = trace_kwargs["metadata"].get("model")
@@ -511,11 +515,16 @@ class LangfuseRecorder:
     else:
       start_ns = end_ns - int(duration_ms * 1e6)
 
+    _prop_tags: list[str] | None = None
+    if prompt_version is not None:
+      _prop_tags = [f"prompt_version:{prompt_version}"]
+
     with propagate_attributes(
         user_id=trace_identity.get("user_id"),
         session_id=trace_identity.get("session_id"),
         trace_name=trace_kwargs["name"],
         metadata={k: str(v) for k, v in trace_kwargs["metadata"].items()},
+        tags=_prop_tags,
     ):
       obs = self.client.start_observation(
           name=trace_kwargs["name"],
@@ -549,6 +558,7 @@ class LangfuseRecorder:
       start_time_perf: float | None = None,
       user_id: str | None = None,
       session_id: str | None = None,
+      prompt_version: str | None = None,
   ) -> None:
     response_payload = self._summarize_stream_response(response_text)
     self.record(
@@ -562,4 +572,5 @@ class LangfuseRecorder:
         stream=True,
         user_id=user_id,
         session_id=session_id,
+        prompt_version=prompt_version,
     )
