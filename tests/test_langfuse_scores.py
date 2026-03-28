@@ -1,10 +1,7 @@
 from __future__ import annotations
 
 import sys
-from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
-
-import pytest
 
 from eval.evaluator import (
     CRITERIA,
@@ -50,7 +47,7 @@ def _make_langfuse_client() -> MagicMock:
 
 class TestPushScores:
 
-    def test_push_scores_called_10_times(self) -> None:
+    def test_push_scores_called_5_times(self) -> None:
         eval_result = _make_eval_result(n_samples=1)
         client = _make_langfuse_client()
 
@@ -112,6 +109,8 @@ class TestPushScores:
         push_scores_to_langfuse(eval_result, client)
 
         assert client.start_observation.call_args.kwargs["as_type"] == "evaluator"
+
+
 class TestNoLangfuse:
 
     def test_no_langfuse_skips_push(self) -> None:

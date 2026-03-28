@@ -177,9 +177,7 @@ def build_batch_judge_prompt(
     expected_answer: str,
     response: str,
 ) -> str:
-    criteria_lines = "\n".join(
-        f"- {criterion_name}: {_CRITERION_DESCRIPTIONS[criterion_name]}" for criterion_name in CRITERIA
-    )
+    criteria_lines = "\n".join(f"- {criterion_name}" for criterion_name in CRITERIA)
     return (
         "Judge the AI response against ALL criteria independently.\n\n"
         f"Question: {question}\n\n"
