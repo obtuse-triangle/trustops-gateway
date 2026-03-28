@@ -439,7 +439,7 @@ async def run_evaluation(
                             criterion=c,
                             passed=True,
                             confidence=1.0,
-                            score=5.0,
+                            score=1.0,
                         )
                         for c in CRITERIA
                     ],
