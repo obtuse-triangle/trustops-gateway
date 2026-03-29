@@ -9,3 +9,9 @@ __pycache__/
 venv/
 .conda/
 .mypy_cache/
+prompts/*
+!prompts/.gitkeep
+.sisyphus/
+SKILL.md
+skills-lock.json
+.agents/
