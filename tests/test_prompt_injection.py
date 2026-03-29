@@ -26,6 +26,7 @@ def _make_settings() -> Settings:
         max_response_bytes=20 * 1024 * 1024,
         log_level="DEBUG",
         prompts_dir="/nonexistent",
+        prompt_config_path="/nonexistent/prompt-config.yaml",
         canary_weight_env="CANARY_WEIGHT",
     )
 
@@ -93,7 +94,7 @@ def _make_test_app(
     langfuse: Any = None,
     prompt_manager: PromptManager | None = None,
 ):
-    from fastapi import FastAPI
+    from fastapi import FastAPI  # pyright: ignore[reportMissingImports]
     from app.routes import router
 
     app = FastAPI()

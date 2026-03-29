@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
-import pytest
+import pytest  # pyright: ignore[reportMissingImports]
 
 from app.settings import Settings
 from app.langfuse_recorder import LangfuseRecorder
@@ -21,6 +21,7 @@ def mock_settings() -> Settings:
         request_timeout_seconds=30.0,
         max_response_bytes=20 * 1024 * 1024,
         log_level="DEBUG",
+        prompt_config_path="/nonexistent/prompt-config.yaml",
     )
 
 

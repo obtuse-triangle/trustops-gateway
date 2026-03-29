@@ -17,6 +17,7 @@ def _make_settings() -> Settings:
         request_timeout_seconds=30.0,
         max_response_bytes=20 * 1024 * 1024,
         log_level="DEBUG",
+        prompt_config_path="/nonexistent/prompt-config.yaml",
     )
 
 
