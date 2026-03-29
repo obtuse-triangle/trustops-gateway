@@ -472,6 +472,7 @@ class LangfuseRecorder:
       user_id: str | None = None,
       session_id: str | None = None,
       prompt_version: str | None = None,
+      trace_name: str | None = None,
   ) -> None:
     if self.client is None:
       return
@@ -481,7 +482,7 @@ class LangfuseRecorder:
         session_id=session_id,
     )
     trace_kwargs: dict[str, Any] = {
-        "name": f"{method.upper()} {path}",
+        "name": trace_name or f"{method.upper()} {path}",
         "input": self._sanitize_payload(
             {
                 "path": path,
@@ -559,6 +560,7 @@ class LangfuseRecorder:
       user_id: str | None = None,
       session_id: str | None = None,
       prompt_version: str | None = None,
+      trace_name: str | None = None,
   ) -> None:
     response_payload = self._summarize_stream_response(response_text)
     self.record(
@@ -573,4 +575,5 @@ class LangfuseRecorder:
         user_id=user_id,
         session_id=session_id,
         prompt_version=prompt_version,
+        trace_name=trace_name,
     )
