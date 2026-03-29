@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import re
 from pathlib import Path
 from unittest.mock import patch
 
@@ -116,6 +117,28 @@ def test_load_dataset_all_korean():
         )
 
 
+def test_dataset_answer_token_overlap_is_low():
+    samples = load_dataset(str(EVAL_DATA_PATH))
+    for sample in samples:
+        context_tokens = set(re.findall(r"[A-Za-z가-힣0-9_-]+", sample.context.lower()))
+        answer_tokens = set(re.findall(r"[A-Za-z가-힣0-9_-]+", sample.expected_answer.lower()))
+        overlap_ratio = len(context_tokens & answer_tokens) / len(answer_tokens)
+        assert overlap_ratio < 0.30
+
+
+def test_dataset_context_nontrivial_length():
+    samples = load_dataset(str(EVAL_DATA_PATH))
+    for sample in samples:
+        assert len(sample.context) >= 50
+        assert len(sample.expected_answer) >= 20
+
+
+def test_dataset_question_asks_something():
+    samples = load_dataset(str(EVAL_DATA_PATH))
+    for sample in samples:
+        assert "?" in sample.question or sample.question.endswith("요?")
+
+
 def test_batch_judge_prompt_contains_all_criteria():
     prompt = build_batch_judge_prompt(
         question="test question",
@@ -136,6 +159,46 @@ def test_batch_judge_prompt_contains_independence_instruction():
     )
     assert "independently" in prompt or "independent" in prompt
     assert "What is K3s?" in prompt
+
+
+def test_batch_judge_prompt_contains_criterion_rubric():
+    prompt = build_batch_judge_prompt(
+        question="What is K3s?",
+        context="K3s is a lightweight Kubernetes distribution.",
+        expected_answer="K3s is lightweight Kubernetes.",
+        response="K3s is Kubernetes.",
+    )
+    assert "PASS only if" in prompt
+    assert "FAIL if" in prompt
+
+
+def test_batch_judge_prompt_faithfulness_rubric():
+    prompt = build_batch_judge_prompt(
+        question="What is K3s?",
+        context="K3s is a lightweight Kubernetes distribution.",
+        expected_answer="K3s is lightweight Kubernetes.",
+        response="K3s is Kubernetes.",
+    )
+    assert (
+        "hallucinat" in prompt.lower()
+        or "unsupported" in prompt.lower()
+        or "context에 없는" in prompt
+    )
+
+
+def test_batch_judge_prompt_safety_rubric():
+    prompt = build_batch_judge_prompt(
+        question="What is K3s?",
+        context="K3s is a lightweight Kubernetes distribution.",
+        expected_answer="K3s is lightweight Kubernetes.",
+        response="K3s is Kubernetes.",
+    )
+    assert (
+        "harmful" in prompt.lower()
+        or "offensive" in prompt.lower()
+        or "privacy" in prompt.lower()
+        or "over-refus" in prompt.lower()
+    )
 
 
 def test_batch_judge_parse_valid_response():
