@@ -10,9 +10,10 @@ from typing import Any
 from urllib.parse import urljoin
 
 import httpx
-from fastapi import HTTPException, Request, Response
-from fastapi.responses import StreamingResponse
+from fastapi import HTTPException, Request, Response  # pyright: ignore[reportMissingImports]
+from fastapi.responses import StreamingResponse  # pyright: ignore[reportMissingImports]
 
+from app.config_loader import PromptConfig
 from app.langfuse_recorder import LangfuseRecorder
 from app.prompt_manager import PromptManager
 from app.settings import Settings
@@ -80,6 +81,56 @@ def create_http_client(settings: Settings) -> httpx.AsyncClient:
   )
 
 
+def _apply_generation_config(request_json: dict[str, Any], config: PromptConfig) -> dict[str, Any]:
+  updated = dict(request_json)
+  if config.temperature is not None:
+    updated["temperature"] = config.temperature
+  if config.top_p is not None:
+    updated["top_p"] = config.top_p
+  if config.top_k is not None:
+    updated["top_k"] = config.top_k
+  return updated
+
+
+def _apply_system_prompt(request_json: dict[str, Any], system_prompt: str) -> dict[str, Any]:
+  updated = dict(request_json)
+  updated.pop("system_prompt", None)
+
+  if not system_prompt.strip():
+    return updated
+
+  messages = list(updated.get("messages") or [])
+  if messages and isinstance(messages[0], dict) and messages[0].get("role") == "system":
+    messages[0] = {**messages[0], "content": system_prompt}
+  else:
+    messages.insert(0, {"role": "system", "content": system_prompt})
+
+  updated["messages"] = messages
+  return updated
+
+
+def apply_preview_config(request_json: dict[str, Any], config: PromptConfig | None) -> dict[str, Any]:
+  updated = dict(request_json)
+  request_system_prompt = updated.pop("system_prompt", None)
+  system_prompt: str | None = request_system_prompt if isinstance(request_system_prompt, str) else None
+
+  if config is not None:
+    if not (isinstance(system_prompt, str) and system_prompt.strip()):
+      system_prompt = config.system_prompt
+
+    if updated.get("temperature") is None and config.temperature is not None:
+      updated["temperature"] = config.temperature
+    if updated.get("top_p") is None and config.top_p is not None:
+      updated["top_p"] = config.top_p
+    if updated.get("top_k") is None and config.top_k is not None:
+      updated["top_k"] = config.top_k
+
+  if isinstance(system_prompt, str) and system_prompt.strip():
+    updated = _apply_system_prompt(updated, system_prompt)
+
+  return updated
+
+
 async def read_request_body(request: Request, settings: Settings) -> bytes:
   body = await request.body()
   if len(body) > settings.max_response_bytes:
@@ -95,18 +146,26 @@ async def proxy_request(
     settings: Settings,
     langfuse: LangfuseRecorder | None,
     prompt_manager: PromptManager | None = None,
+    upstream_path: str | None = None,
+    request_json_override: dict[str, Any] | None = None,
+    body_override: bytes | None = None,
+    apply_generation_config: bool = True,
+    trace_name: str | None = None,
 ) -> Response:
-  upstream_url = build_upstream_url(settings.vllm_base_url, path)
-  body = await read_request_body(request, settings)
+  upstream_url = build_upstream_url(settings.vllm_base_url, upstream_path or path)
+  body = body_override
+  if body is None:
+    body = await read_request_body(request, settings)
   params = dict(request.query_params)
   headers = forward_headers(request)
   start = time.perf_counter()
 
-  request_json: Any = None
-  try:
-    request_json = json.loads(body.decode("utf-8")) if body else None
-  except Exception:
-    request_json = None
+  request_json: Any = request_json_override
+  if request_json is None:
+    try:
+      request_json = json.loads(body.decode("utf-8")) if body else None
+    except Exception:
+      request_json = None
   trace_identity = extract_trace_identity(request, request_json)
 
   version_tag: str | None = None
@@ -130,6 +189,17 @@ async def proxy_request(
           headers["content-type"] = "application/json"
       except Exception:
         pass
+
+  prompt_config_loader = getattr(request.app.state, "prompt_config_loader", None)
+  prompt_config = prompt_config_loader.get_config() if prompt_config_loader is not None else None
+  if apply_generation_config and path == "/v1/chat/completions" and isinstance(request_json, dict) and prompt_config is not None:
+    request_json = _apply_generation_config(request_json, prompt_config)
+    try:
+      body = json.dumps(request_json).encode("utf-8")
+      if "content-type" not in {k.lower() for k in headers}:
+        headers["content-type"] = "application/json"
+    except Exception:
+      pass
 
   is_streaming_request = bool(isinstance(
     request_json, dict) and request_json.get("stream"))
@@ -225,6 +295,7 @@ async def proxy_request(
                   user_id=trace_identity["user_id"],
                   session_id=trace_identity["session_id"],
                   prompt_version=version_tag,
+                  trace_name=trace_name,
               ),
           )
         # Pass real exc_info so httpx can properly clean up the connection
@@ -273,6 +344,7 @@ async def proxy_request(
         user_id=trace_identity["user_id"],
         session_id=trace_identity["session_id"],
         prompt_version=version_tag,
+        trace_name=trace_name,
     )
 
   if response_error is not None:

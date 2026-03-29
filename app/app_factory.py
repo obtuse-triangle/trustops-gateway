@@ -4,8 +4,9 @@ import logging
 
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, Request, Response
+from fastapi import FastAPI, Request, Response  # pyright: ignore[reportMissingImports]
 
+from app.config_loader import PromptConfigLoader
 from app.langfuse_recorder import LangfuseRecorder
 from app.prompt_manager import PromptManager
 from app.proxy import create_http_client
@@ -27,6 +28,7 @@ def create_app() -> FastAPI:
         settings.prompts_dir,
         canary_weight_env=settings.canary_weight_env,
     )
+    app.state.prompt_config_loader = PromptConfigLoader(settings.prompt_config_path)
     logger.info("Gateway started for upstream %s", settings.vllm_base_url)
     try:
       yield
@@ -34,9 +36,10 @@ def create_app() -> FastAPI:
       client = app.state.http_client
       await client.aclose()
       langfuse = getattr(app.state, "langfuse", None)
-      if getattr(langfuse, "client", None) is not None:
+      langfuse_client = getattr(langfuse, "client", None)
+      if langfuse_client is not None:
         try:
-          langfuse.client.flush()
+          langfuse_client.flush()
         except Exception:
           logger.exception("Failed to flush Langfuse on shutdown")
       prompt_manager = getattr(app.state, "prompt_manager", None)
@@ -45,6 +48,12 @@ def create_app() -> FastAPI:
           prompt_manager.stop()
         except Exception:
           logger.exception("Failed to stop PromptManager on shutdown")
+      prompt_config_loader = getattr(app.state, "prompt_config_loader", None)
+      if prompt_config_loader is not None:
+        try:
+          prompt_config_loader.stop()
+        except Exception:
+          logger.exception("Failed to stop PromptConfigLoader on shutdown")
 
   app = FastAPI(title="trustOpsBack vLLM Gateway",
                 version="0.1.0", lifespan=lifespan)
