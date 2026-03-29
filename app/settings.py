@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import os
 
-from dotenv import load_dotenv
+from dotenv import load_dotenv  # pyright: ignore[reportMissingImports]
 
 load_dotenv()
 
@@ -20,6 +20,7 @@ class Settings:
     max_response_bytes: int
     log_level: str
     prompts_dir: str = "/app/prompts"
+    prompt_config_path: str = "/app/prompt-config.yaml"
     canary_weight_env: str = "CANARY_WEIGHT"
 
 
@@ -41,5 +42,6 @@ def get_settings() -> Settings:
         max_response_bytes=int(os.getenv("MAX_RESPONSE_BYTES", str(20 * 1024 * 1024))),
         log_level=os.getenv("LOG_LEVEL", "INFO").upper(),
         prompts_dir=os.getenv("PROMPTS_DIR", "/app/prompts"),
+        prompt_config_path=os.getenv("PROMPT_CONFIG_PATH", "/app/prompt-config.yaml"),
         canary_weight_env=os.getenv("CANARY_WEIGHT_ENV", "CANARY_WEIGHT"),
     )
