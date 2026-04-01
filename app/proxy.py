@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import random
 import sys
 import time
 from typing import Any
@@ -15,7 +14,6 @@ from fastapi.responses import StreamingResponse  # pyright: ignore[reportMissing
 
 from app.config_loader import PromptConfig
 from app.langfuse_recorder import LangfuseRecorder
-from app.prompt_manager import PromptManager
 from app.settings import Settings
 
 logger = logging.getLogger("trustopsback")
@@ -145,7 +143,6 @@ async def proxy_request(
     client: httpx.AsyncClient,
     settings: Settings,
     langfuse: LangfuseRecorder | None,
-    prompt_manager: PromptManager | None = None,
     upstream_path: str | None = None,
     request_json_override: dict[str, Any] | None = None,
     body_override: bytes | None = None,
@@ -168,32 +165,22 @@ async def proxy_request(
       request_json = None
   trace_identity = extract_trace_identity(request, request_json)
 
-  version_tag: str | None = None
-  if (
-      prompt_manager is not None
-      and isinstance(request_json, dict)
-      and isinstance(request_json.get("messages"), list)
-  ):
-    _roll = random.random()
-    _prompt_text, version_tag = prompt_manager.get_prompt(_roll)
-    if _prompt_text:
-      _msgs = list(request_json["messages"])
-      if _msgs and isinstance(_msgs[0], dict) and _msgs[0].get("role") == "system":
-        _msgs[0] = {**_msgs[0], "content": _prompt_text}
-      else:
-        _msgs.insert(0, {"role": "system", "content": _prompt_text})
-      request_json = {**request_json, "messages": _msgs}
-      try:
-        body = json.dumps(request_json).encode("utf-8")
-        if "content-type" not in {k.lower() for k in headers}:
-          headers["content-type"] = "application/json"
-      except Exception:
-        pass
-
   prompt_config_loader = getattr(request.app.state, "prompt_config_loader", None)
   prompt_config = prompt_config_loader.get_config() if prompt_config_loader is not None else None
+  version_tag: str | None = None
+  if prompt_config is not None:
+    version_tag = prompt_config.prompt_version or None
   if apply_generation_config and path == "/v1/chat/completions" and isinstance(request_json, dict) and prompt_config is not None:
     request_json = _apply_generation_config(request_json, prompt_config)
+    try:
+      body = json.dumps(request_json).encode("utf-8")
+      if "content-type" not in {k.lower() for k in headers}:
+        headers["content-type"] = "application/json"
+    except Exception:
+      pass
+
+  if path == "/v1/chat/completions" and isinstance(request_json, dict) and prompt_config is not None and prompt_config.system_prompt:
+    request_json = _apply_system_prompt(request_json, prompt_config.system_prompt)
     try:
       body = json.dumps(request_json).encode("utf-8")
       if "content-type" not in {k.lower() for k in headers}:

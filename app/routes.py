@@ -5,7 +5,7 @@ from typing import Any
 
 from fastapi import APIRouter, Request, Response
 
-from app.dependencies import get_http_client, get_langfuse, get_prompt_manager, get_settings
+from app.dependencies import get_http_client, get_langfuse, get_settings
 from app.proxy import apply_preview_config, proxy_request
 
 router = APIRouter()
@@ -37,7 +37,6 @@ async def proxy_v1(path: str, request: Request) -> Response:
       client=get_http_client(request),
       settings=settings,
       langfuse=get_langfuse(request),
-      prompt_manager=get_prompt_manager(request),
   )
 
 
@@ -50,7 +49,6 @@ async def proxy_openai_compat(path: str, request: Request) -> Response:
       client=get_http_client(request),
       settings=settings,
       langfuse=get_langfuse(request),
-      prompt_manager=get_prompt_manager(request),
   )
 
 
@@ -75,7 +73,6 @@ async def preview(request: Request) -> Response:
       client=get_http_client(request),
       settings=settings,
       langfuse=get_langfuse(request),
-      prompt_manager=None,
       request_json_override=preview_json,
       body_override=json.dumps(preview_json).encode("utf-8"),
       apply_generation_config=False,

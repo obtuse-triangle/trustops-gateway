@@ -8,7 +8,6 @@ from fastapi import FastAPI, Request, Response  # pyright: ignore[reportMissingI
 
 from app.config_loader import PromptConfigLoader
 from app.langfuse_recorder import LangfuseRecorder
-from app.prompt_manager import PromptManager
 from app.proxy import create_http_client
 from app.routes import router
 from app.settings import get_settings
@@ -24,10 +23,6 @@ def create_app() -> FastAPI:
     app.state.settings = settings
     app.state.http_client = create_http_client(settings)
     app.state.langfuse = LangfuseRecorder(settings)
-    app.state.prompt_manager = PromptManager(
-        settings.prompts_dir,
-        canary_weight_env=settings.canary_weight_env,
-    )
     app.state.prompt_config_loader = PromptConfigLoader(settings.prompt_config_path)
     logger.info("Gateway started for upstream %s", settings.vllm_base_url)
     try:
@@ -42,12 +37,6 @@ def create_app() -> FastAPI:
           langfuse_client.flush()
         except Exception:
           logger.exception("Failed to flush Langfuse on shutdown")
-      prompt_manager = getattr(app.state, "prompt_manager", None)
-      if prompt_manager is not None:
-        try:
-          prompt_manager.stop()
-        except Exception:
-          logger.exception("Failed to stop PromptManager on shutdown")
       prompt_config_loader = getattr(app.state, "prompt_config_loader", None)
       if prompt_config_loader is not None:
         try:

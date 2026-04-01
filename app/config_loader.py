@@ -19,9 +19,7 @@ class PromptConfig:
     temperature: float | None
     top_p: float | None
     top_k: int | None
-    prompt_v1: str
-    prompt_v2: str
-    canary_weight: float
+    prompt_version: str
 
 
 class _ConfigEventHandler(FileSystemEventHandler):
@@ -105,18 +103,15 @@ def load_prompt_config(path: str) -> PromptConfig:
     raw = yaml.safe_load(config_path.read_text(encoding="utf-8"))
     data = _as_mapping(raw or {})
 
-    prompt_v1 = _text_value(data, "prompt_v1.txt", "prompt_v1")
-    prompt_v2 = _text_value(data, "prompt_v2.txt", "prompt_v2")
-    system_prompt = _text_value(data, "system_prompt", "system_prompt.txt") or prompt_v1
+    system_prompt = _text_value(data, "system_prompt", "system_prompt.txt")
+    prompt_version = _text_value(data, "prompt_version")
 
     return PromptConfig(
         system_prompt=system_prompt,
         temperature=_float_value(data, "temperature"),
         top_p=_float_value(data, "top_p"),
         top_k=_int_value(data, "top_k"),
-        prompt_v1=prompt_v1,
-        prompt_v2=prompt_v2,
-        canary_weight=_float_value(data, "canary_weight") or 0.0,
+        prompt_version=prompt_version,
     )
 
 
@@ -124,7 +119,7 @@ class PromptConfigLoader:
     def __init__(self, config_path: str) -> None:
         self._config_path = Path(config_path)
         self._lock = threading.RLock()
-        self._config = PromptConfig("", None, None, None, "", "", 0.0)
+        self._config = PromptConfig("", None, None, None, "")
         self._observer: Observer | None = None
 
         self._reload()

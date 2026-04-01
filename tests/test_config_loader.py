@@ -9,7 +9,6 @@ from unittest.mock import AsyncMock, MagicMock
 import httpx
 
 from app.config_loader import PromptConfigLoader, load_prompt_config
-from app.prompt_manager import PromptManager
 from app.settings import Settings
 
 
@@ -24,17 +23,8 @@ def _make_settings(prompt_config_path: str) -> Settings:
         request_timeout_seconds=30.0,
         max_response_bytes=20 * 1024 * 1024,
         log_level="DEBUG",
-        prompts_dir="/nonexistent",
         prompt_config_path=prompt_config_path,
-        canary_weight_env="CANARY_WEIGHT",
     )
-
-
-def _make_prompt_dir(tmp_path: Path, text: str = "You are a test assistant.") -> Path:
-    d = tmp_path / "prompts"
-    d.mkdir()
-    (d / "prompt_v1.txt").write_text(text, encoding="utf-8")
-    return d
 
 
 def _make_upstream_client(captured: dict[str, Any]) -> MagicMock:
@@ -57,7 +47,7 @@ def _make_upstream_client(captured: dict[str, Any]) -> MagicMock:
     return client
 
 
-def _make_test_app(http_client: Any, settings: Settings, prompt_manager: PromptManager, prompt_config_loader: PromptConfigLoader):
+def _make_test_app(http_client: Any, settings: Settings, prompt_config_loader: PromptConfigLoader):
     from fastapi import FastAPI  # pyright: ignore[reportMissingImports]
     from app.routes import router
 
@@ -65,7 +55,6 @@ def _make_test_app(http_client: Any, settings: Settings, prompt_manager: PromptM
     app.state.settings = settings
     app.state.http_client = http_client
     app.state.langfuse = None
-    app.state.prompt_manager = prompt_manager
     app.state.prompt_config_loader = prompt_config_loader
     app.include_router(router)
     return app
@@ -82,11 +71,7 @@ data:
   temperature: "0.25"
   top_p: "0.9"
   top_k: "40"
-  canary_weight: "10"
-  prompt_v1.txt: |
-    stable text
-  prompt_v2.txt: |
-    canary text
+  prompt_version: "v1"
 """.strip(),
         encoding="utf-8",
     )
@@ -97,9 +82,26 @@ data:
     assert config.temperature == 0.25
     assert config.top_p == 0.9
     assert config.top_k == 40
-    assert config.canary_weight == 10.0
-    assert config.prompt_v1 == "stable text"
-    assert config.prompt_v2 == "canary text"
+    assert config.prompt_version == "v1"
+
+
+def test_load_prompt_config_with_only_system_prompt(tmp_path: Path) -> None:
+    config_path = tmp_path / "prompt-config.yaml"
+    config_path.write_text(
+        """
+data:
+  system_prompt: "Minimal config"
+""".strip(),
+        encoding="utf-8",
+    )
+
+    config = load_prompt_config(str(config_path))
+
+    assert config.system_prompt == "Minimal config"
+    assert config.temperature is None
+    assert config.top_p is None
+    assert config.top_k is None
+    assert config.prompt_version == ""
 
 
 def test_prompt_config_loader_hot_reloads(tmp_path: Path) -> None:
@@ -110,10 +112,7 @@ data:
   temperature: "0.1"
   top_p: "0.7"
   top_k: "8"
-  prompt_v1.txt: |
-    first
-  prompt_v2.txt: |
-    second
+  prompt_version: "v1"
 """.strip(),
         encoding="utf-8",
     )
@@ -128,10 +127,7 @@ data:
   temperature: "0.8"
   top_p: "0.2"
   top_k: "12"
-  prompt_v1.txt: |
-    updated first
-  prompt_v2.txt: |
-    updated second
+  prompt_version: "v2"
 """.strip(),
             encoding="utf-8",
         )
@@ -141,37 +137,31 @@ data:
         assert config.temperature == 0.8
         assert config.top_p == 0.2
         assert config.top_k == 12
-        assert config.prompt_v1 == "updated first"
-        assert config.prompt_v2 == "updated second"
+        assert config.prompt_version == "v2"
     finally:
         loader.stop()
 
 
 async def test_chat_completions_overrides_client_generation_params(tmp_path: Path) -> None:
-    prompt_dir = _make_prompt_dir(tmp_path)
     config_path = tmp_path / "prompt-config.yaml"
     config_path.write_text(
         """
 data:
+  system_prompt: "Config system prompt"
   temperature: "0.33"
   top_p: "0.77"
   top_k: "11"
-  prompt_v1.txt: |
-    config stable prompt
-  prompt_v2.txt: |
-    config canary prompt
+  prompt_version: "v1"
 """.strip(),
         encoding="utf-8",
     )
 
     captured: dict[str, Any] = {}
-    prompt_manager = PromptManager(str(prompt_dir))
     prompt_config_loader = PromptConfigLoader(str(config_path))
     try:
         app = _make_test_app(
             _make_upstream_client(captured),
             _make_settings(str(config_path)),
-            prompt_manager,
             prompt_config_loader,
         )
         body = json.dumps(
@@ -195,7 +185,38 @@ data:
         assert captured["body"]["top_p"] == 0.77
         assert captured["body"]["top_k"] == 11
         assert captured["body"]["messages"][0]["role"] == "system"
-        assert captured["body"]["messages"][0]["content"] == "You are a test assistant."
+        assert captured["body"]["messages"][0]["content"] == "Config system prompt"
     finally:
         prompt_config_loader.stop()
-        prompt_manager.stop()
+
+
+def test_prompt_version_parsing(tmp_path: Path) -> None:
+    config_path = tmp_path / "prompt-config.yaml"
+    config_path.write_text(
+        """
+data:
+  system_prompt: "Test prompt"
+  prompt_version: "production-v2"
+""".strip(),
+        encoding="utf-8",
+    )
+
+    config = load_prompt_config(str(config_path))
+    assert config.prompt_version == "production-v2"
+
+
+def test_empty_config_returns_defaults(tmp_path: Path) -> None:
+    config_path = tmp_path / "prompt-config.yaml"
+    config_path.write_text(
+        """
+data: {}
+""".strip(),
+        encoding="utf-8",
+    )
+
+    config = load_prompt_config(str(config_path))
+    assert config.system_prompt == ""
+    assert config.temperature is None
+    assert config.top_p is None
+    assert config.top_k is None
+    assert config.prompt_version == ""
