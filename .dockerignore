@@ -1,0 +1,6 @@
+**
+!app/
+!app/**
+!requirements.txt
+!.env.example
+!Dockerfile
