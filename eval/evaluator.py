@@ -444,6 +444,8 @@ async def run_evaluation(
     output_path: str,
     *,
     model: str = "default",
+    commit_sha: str | None = None,
+    workflow_uid: str | None = None,
     dry_run: bool = False,
     request_timeout: float = DEFAULT_LLM_TIMEOUT_SECONDS,
     evaluation_langfuse_client: Any | None = None,
@@ -495,15 +497,25 @@ async def run_evaluation(
             )
             eval_result.samples.append(sr)
 
-    output_records = [
-        {
-            "sample_id": s.sample_id,
-            "scores": {c.criterion: c.score for c in s.criteria},
-            "confidence": {c.criterion: c.confidence for c in s.criteria},
-            "llm_answer": s.llm_answer,
-        }
-        for s in eval_result.samples
-    ]
+    output_records = []
+    for s in eval_result.samples:
+        scores = {c.criterion: c.score for c in s.criteria}
+        confidence = {c.criterion: c.confidence for c in s.criteria}
+        overall_score = sum(scores.values()) / len(scores) if scores else 0.0
+        output_records.append(
+            {
+                "sample_id": s.sample_id,
+                "commit_sha": commit_sha,
+                "workflow_uid": workflow_uid,
+                "dataset_path": dataset_path,
+                "model_id": model,
+                "scores": scores,
+                "confidence": confidence,
+                "overall_score": overall_score,
+                "passed": all(c.passed for c in s.criteria),
+                "llm_answer": s.llm_answer,
+            }
+        )
     Path(output_path).parent.mkdir(parents=True, exist_ok=True)
     with open(output_path, "w", encoding="utf-8") as fh:
         json.dump(output_records, fh, ensure_ascii=False, indent=2)
@@ -593,6 +605,18 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Model name string to pass to the LLM endpoint (default: 'default').",
     )
     parser.add_argument(
+        "--commit-sha",
+        metavar="SHA",
+        default=None,
+        help="Commit SHA to embed in the JSON artifact for provenance.",
+    )
+    parser.add_argument(
+        "--workflow-uid",
+        metavar="UID",
+        default=None,
+        help="Workflow UID to embed in the JSON artifact for provenance.",
+    )
+    parser.add_argument(
         "--dry-run",
         action="store_true",
         help="Skip actual LLM calls; produce mock Pass results for testing.",
@@ -647,6 +671,8 @@ def main() -> None:
         parser.error("--endpoint is required when VLLM_BASE_URL is not set")
 
     request_timeout = args.request_timeout or DEFAULT_LLM_TIMEOUT_SECONDS
+    commit_sha = args.commit_sha or os.getenv("COMMIT_SHA")
+    workflow_uid = args.workflow_uid or os.getenv("WORKFLOW_UID")
 
     langfuse_enabled = os.getenv("LANGFUSE_ENABLED", "true").strip().lower() not in {"0", "false", "no", "off"}
     langfuse_host = args.langfuse_host or os.getenv("LANGFUSE_HOST")
@@ -681,6 +707,8 @@ def main() -> None:
             llm_endpoint=endpoint,
             output_path=args.output,
             model=args.model,
+            commit_sha=commit_sha,
+            workflow_uid=workflow_uid,
             dry_run=args.dry_run,
             request_timeout=request_timeout,
             evaluation_langfuse_client=evaluation_langfuse_client,

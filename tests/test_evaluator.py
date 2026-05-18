@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import re
 from pathlib import Path
 from unittest.mock import patch
@@ -16,6 +17,7 @@ from eval.evaluator import (
     parse_batch_judge_response,
     evaluate_sample,
     load_dataset,
+    run_evaluation,
 )
 
 EVAL_DATA_PATH = Path(__file__).parent.parent / "eval" / "eval_data.jsonl"
@@ -137,6 +139,53 @@ def test_dataset_question_asks_something():
     samples = load_dataset(str(EVAL_DATA_PATH))
     for sample in samples:
         assert "?" in sample.question or sample.question.endswith("요?")
+
+
+async def test_run_evaluation_writes_commit_and_workflow_metadata(tmp_path: Path):
+    dataset_path = tmp_path / "dataset.jsonl"
+    dataset_path.write_text(
+        '{"question":"What is K3s?","context":"K3s is a lightweight Kubernetes distribution.","expected_answer":"K3s is lightweight Kubernetes."}\n',
+        encoding="utf-8",
+    )
+    output_path = tmp_path / "results.json"
+
+    await run_evaluation(
+        str(dataset_path),
+        llm_endpoint="http://localhost:8080",
+        output_path=str(output_path),
+        model="test-model",
+        commit_sha="abc123",
+        workflow_uid="wf-789",
+        dry_run=True,
+    )
+
+    payload = json.loads(output_path.read_text(encoding="utf-8"))
+    assert len(payload) == 1
+    record = payload[0]
+    assert record["commit_sha"] == "abc123"
+    assert record["workflow_uid"] == "wf-789"
+    assert record["dataset_path"] == str(dataset_path)
+    assert record["model_id"] == "test-model"
+    assert record["scores"] == {criterion: 1.0 for criterion in CRITERIA}
+    assert record["confidence"] == {criterion: 1.0 for criterion in CRITERIA}
+    assert record["overall_score"] == 1.0
+    assert record["passed"] is True
+
+
+async def test_run_evaluation_malformed_input_fails_without_artifact(tmp_path: Path):
+    dataset_path = tmp_path / "bad.jsonl"
+    dataset_path.write_text("{not json}\n", encoding="utf-8")
+    output_path = tmp_path / "results.json"
+
+    with pytest.raises(Exception):
+        await run_evaluation(
+            str(dataset_path),
+            llm_endpoint="http://localhost:8080",
+            output_path=str(output_path),
+            dry_run=True,
+        )
+
+    assert not output_path.exists()
 
 
 def test_batch_judge_prompt_contains_all_criteria():
