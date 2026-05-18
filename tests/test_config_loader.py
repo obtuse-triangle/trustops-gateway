@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import time
 from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
@@ -104,7 +103,7 @@ data:
     assert config.prompt_version == ""
 
 
-def test_prompt_config_loader_hot_reloads(tmp_path: Path) -> None:
+def test_prompt_config_loader_keeps_startup_config(tmp_path: Path) -> None:
     config_path = tmp_path / "prompt-config.yaml"
     config_path.write_text(
         """
@@ -131,13 +130,12 @@ data:
 """.strip(),
             encoding="utf-8",
         )
-        time.sleep(0.8)
 
         config = loader.get_config()
-        assert config.temperature == 0.8
-        assert config.top_p == 0.2
-        assert config.top_k == 12
-        assert config.prompt_version == "v2"
+        assert config.temperature == 0.1
+        assert config.top_p == 0.7
+        assert config.top_k == 8
+        assert config.prompt_version == "v1"
     finally:
         loader.stop()
 

@@ -4,11 +4,9 @@ import logging
 import threading
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any
 
 import yaml
-from watchdog.events import FileSystemEventHandler  # pyright: ignore[reportMissingImports]
-from watchdog.observers import Observer  # pyright: ignore[reportMissingImports]
 
 logger = logging.getLogger("trustopsback")
 
@@ -20,35 +18,6 @@ class PromptConfig:
     top_p: float | None
     top_k: int | None
     prompt_version: str
-
-
-class _ConfigEventHandler(FileSystemEventHandler):
-    def __init__(self, loader: "PromptConfigLoader", debounce_seconds: float = 0.3) -> None:
-        super().__init__()
-        self._loader = loader
-        self._debounce_seconds = debounce_seconds
-        self._timer: Optional[threading.Timer] = None
-        self._lock = threading.Lock()
-
-    def _schedule_reload(self) -> None:
-        with self._lock:
-            if self._timer is not None:
-                self._timer.cancel()
-            self._timer = threading.Timer(self._debounce_seconds, self._loader._reload)
-            self._timer.daemon = True
-            self._timer.start()
-
-    def on_modified(self, event) -> None:
-        if not event.is_directory:
-            self._schedule_reload()
-
-    def on_created(self, event) -> None:
-        if not event.is_directory:
-            self._schedule_reload()
-
-    def on_deleted(self, event) -> None:
-        if not event.is_directory:
-            self._schedule_reload()
 
 
 def _as_mapping(raw: Any) -> dict[str, Any]:
@@ -120,17 +89,8 @@ class PromptConfigLoader:
         self._config_path = Path(config_path)
         self._lock = threading.RLock()
         self._config = PromptConfig("", None, None, None, "")
-        self._observer: Observer | None = None
 
         self._reload()
-
-        if self._config_path.parent.is_dir():
-            self._event_handler = _ConfigEventHandler(self)
-            observer = Observer()
-            observer.schedule(self._event_handler, str(self._config_path.parent), recursive=False)
-            observer.start()
-            self._observer = observer
-            logger.info("PromptConfigLoader watching %s", self._config_path)
 
     def _reload(self) -> None:
         try:
@@ -146,7 +106,4 @@ class PromptConfigLoader:
             return self._config
 
     def stop(self) -> None:
-        if self._observer is not None and self._observer.is_alive():
-            self._observer.stop()
-            self._observer.join()
-            logger.info("PromptConfigLoader stopped watching %s", self._config_path)
+        logger.info("PromptConfigLoader stopped for %s", self._config_path)
