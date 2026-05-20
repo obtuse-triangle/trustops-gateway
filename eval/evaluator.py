@@ -681,7 +681,7 @@ def main() -> None:
 
     evaluation_langfuse_client = None
     judge_langfuse_client = None
-    if not args.no_langfuse and not args.dry_run and langfuse_enabled:
+    if not args.no_langfuse and langfuse_enabled:
         if not (langfuse_host and langfuse_public_key and langfuse_secret_key):
             logger.warning(
                 "Langfuse credentials not provided; skipping score upload. "

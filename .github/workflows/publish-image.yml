@@ -11,7 +11,8 @@ permissions:
   packages: write
 
 env:
-  IMAGE_NAME: ghcr.io/obtuse-triangle/trustops-gateway
+  GATEWAY_IMAGE_NAME: ghcr.io/obtuse-triangle/trustops-gateway
+  EVALUATOR_IMAGE_NAME: ghcr.io/obtuse-triangle/trustops-evaluator
 
 jobs:
   publish:
@@ -31,19 +32,31 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Set image tags
+      - name: Set gateway image tags
         id: tags
         run: |
           {
             echo "tags<<EOF"
-            echo "${IMAGE_NAME}:sha-${GITHUB_SHA}"
+            echo "${GATEWAY_IMAGE_NAME}:sha-${GITHUB_SHA}"
             if [ "${GITHUB_REF}" = "refs/heads/main" ]; then
-              echo "${IMAGE_NAME}:latest"
+              echo "${GATEWAY_IMAGE_NAME}:latest"
             fi
             echo "EOF"
           } >> "$GITHUB_OUTPUT"
 
-      - name: Build and push image
+      - name: Set evaluator image tags
+        id: evaluator-tags
+        run: |
+          {
+            echo "tags<<EOF"
+            echo "${EVALUATOR_IMAGE_NAME}:sha-${GITHUB_SHA}"
+            if [ "${GITHUB_REF}" = "refs/heads/main" ]; then
+              echo "${EVALUATOR_IMAGE_NAME}:latest"
+            fi
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Build and push gateway image
         uses: docker/build-push-action@v6
         with:
           context: .
@@ -51,3 +64,12 @@ jobs:
           platforms: linux/amd64
           push: true
           tags: ${{ steps.tags.outputs.tags }}
+
+      - name: Build and push evaluator image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile.evaluator
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.evaluator-tags.outputs.tags }}
