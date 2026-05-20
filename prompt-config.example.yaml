@@ -1,0 +1,11 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: local-prompt-config
+data:
+  system_prompt: |
+    You are a helpful TrustOps gateway assistant.
+  temperature: "0.2"
+  top_p: "0.9"
+  top_k: "40"
+  prompt_version: "local-dev"

@@ -17,6 +17,7 @@ FastAPI 기반의 OpenAI 호환 LLM 게이트웨이입니다. `vllm-qwen3-5` 서
 
 - `VLLM_BASE_URL`: vLLM 서버 주소
 - `GATEWAY_API_KEY`: 선택적 API 키
+- `PROMPT_CONFIG_PATH`: 프롬프트 설정 파일 경로. Kubernetes에서는 `/app/prompt-config.yaml`을 사용하고, 로컬 개발에서는 `./prompt-config.example.yaml`을 사용합니다.
 - `LANGFUSE_ENABLED`: Langfuse 활성화 여부
 - `LANGFUSE_PUBLIC_KEY`, `LANGFUSE_SECRET_KEY`, `LANGFUSE_HOST`: Langfuse 연결 정보
 
@@ -30,6 +31,8 @@ conda activate trustopsback
 cp .env.example .env
 uvicorn app.main:app --reload --host 0.0.0.0 --port 8080
 ```
+
+로컬 개발에서는 `.env.example`의 `PROMPT_CONFIG_PATH=./prompt-config.example.yaml` 값을 그대로 쓰면 됩니다. 운영 Kubernetes Pod에서는 ConfigMap이 `/app/prompt-config.yaml`에 mount되므로 별도 파일을 만들 필요가 없습니다.
 
 ### Pip
 

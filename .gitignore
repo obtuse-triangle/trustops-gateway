@@ -15,3 +15,6 @@ prompts/*
 SKILL.md
 skills-lock.json
 .agents/
+logs/
+eval/test_output*.json
+webui/
