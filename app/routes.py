@@ -6,6 +6,7 @@ from typing import Any
 from fastapi import APIRouter, Request, Response
 
 from app.dependencies import get_http_client, get_langfuse, get_settings
+from app.deploy import trigger_deploy
 from app.proxy import apply_preview_config, proxy_request
 
 router = APIRouter()
@@ -22,9 +23,44 @@ async def health(request: Request) -> dict[str, Any]:
   }
 
 
+@router.post("/deploy")
+async def deploy(request: Request) -> dict:
+  """Update the prompt ConfigMap and trigger a canary rollout.
+
+  Request body:
+    prompt (str): The new system prompt text.
+    temperature (float, optional): Generation temperature.
+    top_p (float, optional): Top-p sampling parameter.
+    top_k (int, optional): Top-k sampling parameter.
+    prompt_version (str, optional): Version identifier.
+
+  Returns metadata about the ConfigMap update and the triggered rollout.
+  """
+  body = await request.json()
+  prompt = body.get("prompt", "").strip()
+
+  if not prompt:
+    from fastapi import HTTPException
+    raise HTTPException(status_code=400, detail="prompt is required")
+
+  result = trigger_deploy(
+      prompt=prompt,
+      temperature=body.get("temperature"),
+      top_p=body.get("top_p"),
+      top_k=body.get("top_k"),
+      prompt_version=body.get("prompt_version"),
+  )
+
+  return {
+      "status": "ok",
+      "namespace": result["namespace"],
+      "configMap": result["configMap"],
+      "rollout": result["rollout"],
+  }
+
+
 @router.get("/")
 async def root(request: Request) -> dict[str, str]:
-  settings = get_settings(request)
   return {"message": "trustOpsBack vLLM gateway", "upstream": settings.vllm_base_url}
 
 
