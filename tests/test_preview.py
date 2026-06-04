@@ -129,7 +129,7 @@ async def test_preview_uses_ui_overrides(tmp_path: Path) -> None:
         assert captured["body"]["temperature"] == 0.7
         assert captured["body"]["top_p"] == 0.8
         assert captured["body"]["top_k"] == 11
-        assert captured["body"]["messages"][0]["content"] == "Config system prompt"
+        assert captured["body"]["messages"][0]["content"] == "UI system prompt"
     finally:
         loader.stop()
 

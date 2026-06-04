@@ -179,7 +179,7 @@ async def proxy_request(
     except Exception:
       pass
 
-  if path == "/v1/chat/completions" and isinstance(request_json, dict) and prompt_config is not None and prompt_config.system_prompt:
+  if apply_generation_config and path == "/v1/chat/completions" and isinstance(request_json, dict) and prompt_config is not None and prompt_config.system_prompt:
     request_json = _apply_system_prompt(request_json, prompt_config.system_prompt)
     try:
       body = json.dumps(request_json).encode("utf-8")

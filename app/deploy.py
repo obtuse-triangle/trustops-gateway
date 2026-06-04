@@ -99,10 +99,14 @@ def _build_config_yaml(
 
 
 def restart_rollout(namespace: str | None = None) -> dict:
-    """Trigger a canary rollout by adding restartAt annotation.
+    """Trigger a new canary rollout by patching pod template annotation.
 
-    Argo Rollouts detects the annotation and initiates a new rollout
-    with the configured canary strategy (10% → pause → 50% → pause → 100%).
+    Adding a timestamp annotation to the pod template spec forces Argo Rollouts
+    to create a new revision, which then follows the canary strategy
+    (10% → pause → 50% → pause → 100%).
+
+    Using spec.restartAt only restarts pods in-place within the same revision,
+    bypassing canary steps entirely.
     """
     ns = namespace or NAMESPACE
     _, custom_api = _build_client()
@@ -111,7 +115,13 @@ def restart_rollout(namespace: str | None = None) -> dict:
 
     patch = {
         "spec": {
-            "restartAt": restart_time,
+            "template": {
+                "metadata": {
+                    "annotations": {
+                        "trustops.back/restartedAt": restart_time,
+                    },
+                },
+            },
         },
     }
 
@@ -124,10 +134,10 @@ def restart_rollout(namespace: str | None = None) -> dict:
             name=ROLLOUT_NAME,
             body=patch,
         )
-        logger.info("Rollout %s/%s restarted at %s", ns, ROLLOUT_NAME, restart_time)
+        logger.info("Rollout %s/%s new revision triggered at %s", ns, ROLLOUT_NAME, restart_time)
         return result.get("metadata", {})
     except Exception as exc:
-        logger.error("Failed to restart Rollout %s/%s: %s", ns, ROLLOUT_NAME, exc)
+        logger.error("Failed to trigger rollout %s/%s: %s", ns, ROLLOUT_NAME, exc)
         raise
 
 
