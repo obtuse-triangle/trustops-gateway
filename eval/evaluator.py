@@ -563,15 +563,19 @@ def _start_active_fetch_observation(
     as_type: str,
     input_data: dict[str, Any],
     metadata: dict[str, Any],
+    trace_context: dict[str, str] | None = None,
 ) -> Any | None:
     """Start a Langfuse observation (generation or span), returning the observation or None on failure."""
     try:
-        return langfuse_client.start_observation(
+        kwargs: dict[str, Any] = dict(
             name=name,
             as_type=as_type,
             input=input_data,
             metadata=metadata,
         )
+        if trace_context is not None:
+            kwargs["trace_context"] = trace_context
+        return langfuse_client.start_observation(**kwargs)
     except Exception as exc:
         logger.warning("Failed to start Langfuse observation %s: %s", name, exc)
         return None
@@ -628,6 +632,7 @@ async def evaluate_sample_active_fetch(
     langfuse_client: Any | None = None,
     active_fetch_trace_name: str | None = None,
     active_fetch_parent_observation_id: str | None = None,
+    active_fetch_parent_trace_id: str | None = None,
     suppress_backend_langfuse: bool = False,
 ) -> dict[str, Any]:
     """Evaluate a sample using active fetch — the model fetches its own materials via tool calls."""
@@ -667,6 +672,10 @@ async def evaluate_sample_active_fetch(
                     "active_fetch_trace_name": active_fetch_trace_name,
                     "iteration": iteration + 1,
                 },
+                trace_context={
+                    "trace_id": active_fetch_parent_trace_id,
+                    "parent_span_id": active_fetch_parent_observation_id,
+                } if active_fetch_parent_trace_id else None,
             )
 
         async with semaphore:
@@ -757,6 +766,10 @@ async def evaluate_sample_active_fetch(
                             "active_fetch_trace_name": active_fetch_trace_name,
                             "iteration": iteration + 1,
                         },
+                        trace_context={
+                            "trace_id": active_fetch_parent_trace_id,
+                            "parent_span_id": active_fetch_parent_observation_id,
+                        } if active_fetch_parent_trace_id else None,
                     )
 
                 results = fetch_materials(query, top_k, corpus_dir)
@@ -892,6 +905,7 @@ async def _evaluate_active_fetch_sample_with_tracing(
             langfuse_client=evaluation_langfuse_client if use_tracing else None,
             active_fetch_trace_name=sample_trace_name if use_tracing else None,
             active_fetch_parent_observation_id=active_fetch_parent_observation_id,
+            active_fetch_parent_trace_id=active_fetch_score_trace_id,
             suppress_backend_langfuse=True,
         )
 
@@ -916,6 +930,10 @@ async def _evaluate_active_fetch_sample_with_tracing(
                     "mode": "active_fetch",
                     "sample_id": f"sample_{sample_index}",
                 },
+                trace_context={
+                    "trace_id": active_fetch_score_trace_id or sample_trace_name,
+                    "parent_span_id": active_fetch_parent_observation_id,
+                } if active_fetch_parent_observation_id else None,
             )
 
         judge_response = await call_llm(
@@ -973,6 +991,9 @@ async def _evaluate_active_fetch_sample_with_tracing(
         # End parent observation
         if parent_obs is not None:
             _safe_end_observation(parent_obs)
+
+        if evaluation_langfuse_client is not None:
+            evaluation_langfuse_client.flush()
 
     # Enrich the result dict so the caller can build a SampleResult directly
     af_result["scores"] = scores_dict
@@ -1119,6 +1140,11 @@ async def run_evaluation(
                 )
                 af_results.append(af_result)
 
+            # Flush all active-fetch observations after processing all samples
+            if evaluation_langfuse_client is not None:
+                evaluation_langfuse_client.flush()
+
+            for af_result in af_results:
                 sr = SampleResult(
                     sample_id=af_result["sample_id"],
                     question=af_result["question"],
