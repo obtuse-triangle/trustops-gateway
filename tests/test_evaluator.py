@@ -966,6 +966,66 @@ async def test_run_evaluation_static_regression(tmp_path: Path) -> None:
     assert "loop_terminated_early" not in record
 
 
+async def test_static_mode_unchanged(tmp_path: Path) -> None:
+    """Static mode must not use any active-fetch features: no skip headers,
+    no active-fetch functions called, no active-fetch fields in output,
+    and Langfuse behavior unchanged from before."""
+    dataset_path = tmp_path / "dataset.jsonl"
+    dataset_path.write_text(
+        '{"question":"What is K3s?","context":"K3s is lightweight K8s.","expected_answer":"K3s is lightweight."}\n',
+        encoding="utf-8",
+    )
+    output_path = tmp_path / "results.json"
+
+    call_headers: list[dict | None] = []
+
+    async def mock_call(prompt: str, *, endpoint: str, **kwargs: object) -> dict:
+        call_headers.append(kwargs.get("extra_headers"))
+        return _BATCH_PASS_RESPONSE
+
+    with patch("eval.evaluator.call_llm", side_effect=mock_call) as mock_cl:
+        with patch("eval.evaluator.evaluate_sample_active_fetch") as mock_active:
+            with patch("eval.evaluator.call_llm_messages") as mock_llm_messages:
+                eval_result = await run_evaluation(
+                    str(dataset_path),
+                    llm_endpoint="http://localhost:8080",
+                    output_path=str(output_path),
+                    model="test-model",
+                    dry_run=False,
+                )
+
+    mock_active.assert_not_called()
+    mock_llm_messages.assert_not_called()
+    assert mock_cl.call_count == 2
+
+    for headers in call_headers:
+        assert headers is None, f"Static mode should not send extra_headers, got: {headers}"
+
+    assert len(eval_result.samples) == 1
+    sample = eval_result.samples[0]
+    assert len(sample.criteria) == len(CRITERIA)
+    for cr in sample.criteria:
+        assert cr.criterion in CRITERIA
+        assert cr.passed is True
+        assert cr.confidence == 1.0
+        assert cr.score == 1.0
+
+    payload = json.loads(output_path.read_text(encoding="utf-8"))
+    assert len(payload) == 1
+    record = payload[0]
+    assert "scores" in record
+    assert record["scores"] == {c: 1.0 for c in CRITERIA}
+    assert "confidence" in record
+    assert "overall_score" in record
+    assert "passed" in record
+    assert "llm_answer" in record
+    assert "mode" not in record
+    assert "fetched_doc_ids" not in record
+    assert "fetch_metrics" not in record
+    assert "tool_calls" not in record
+    assert "loop_terminated_early" not in record
+
+
 async def test_run_evaluation_active_fetch_e2e(tmp_path: Path) -> None:
     dataset_path = tmp_path / "dataset.jsonl"
     dataset_path.write_text(
@@ -1219,6 +1279,80 @@ async def test_active_fetch_no_tool_call_still_traced():
     # No fetch observation since there were no tool calls
     obs_mock.update.assert_called_once()
     obs_mock.end.assert_called_once()
+
+
+async def test_active_fetch_no_tool_call_first_iteration_traced() -> None:
+    """Verify first LLM iteration is traced even when model returns immediately
+    without tool calls — tested through the full _evaluate_active_fetch_sample_with_tracing
+    flow (outer wrapper + inner evaluate_sample_active_fetch)."""
+    sample = EvalSample(question="direct answer q", context="", expected_answer="direct a")
+
+    stop_response = {
+        "choices": [{
+            "finish_reason": "stop",
+            "message": {"content": "direct answer"},
+        }]
+    }
+
+    langfuse_client = MagicMock()
+    parent_obs = MagicMock()
+    parent_obs.id = "parent-obs-001"
+    parent_obs.trace_id = "trace-abc-001"
+    iter_obs = MagicMock()
+    iter_obs.id = "iter-obs-001"
+    judge_obs = MagicMock()
+    judge_obs.id = "judge-obs-001"
+    langfuse_client.start_observation.side_effect = [parent_obs, iter_obs, judge_obs]
+
+    with patch("eval.evaluator._propagate_attributes", return_value=MagicMock()):
+        with patch("eval.evaluator.call_llm_messages", new_callable=AsyncMock) as mock_llm:
+            mock_llm.side_effect = [stop_response]
+            with patch("eval.evaluator.fetch_materials") as mock_fetch:
+                with patch("eval.evaluator.call_llm", new_callable=AsyncMock) as mock_call_llm:
+                    mock_call_llm.return_value = _BATCH_PASS_RESPONSE
+
+                    result = await _evaluate_active_fetch_sample_with_tracing(
+                        sample, 0,
+                        llm_endpoint="http://test",
+                        evaluation_langfuse_client=langfuse_client,
+                    )
+
+    mock_fetch.assert_not_called()
+    assert mock_llm.call_count == 1
+
+    obs_calls = langfuse_client.start_observation.call_args_list
+    assert len(obs_calls) == 3
+
+    assert obs_calls[0][1]["name"] == "rag-active-fetch-sample"
+    assert obs_calls[0][1]["as_type"] == "span"
+
+    assert obs_calls[1][1]["name"] == "active_fetch.iteration_1.llm"
+    assert obs_calls[1][1]["as_type"] == "generation"
+    assert obs_calls[1][1]["metadata"]["parent_observation_id"] == "parent-obs-001"
+
+    assert obs_calls[2][1]["name"] == "rag-active-fetch-judge"
+    assert obs_calls[2][1]["as_type"] == "generation"
+
+    iter_obs.update.assert_called_once()
+    iter_obs.end.assert_called_once()
+
+    assert mock_call_llm.call_count == 1
+    call_kwargs = mock_call_llm.call_args[1]
+    assert call_kwargs.get("extra_headers") == {"X-Skip-Langfuse": "true"}
+
+    parent_obs.end.assert_called_once()
+
+    assert langfuse_client.create_score.call_count == len(CRITERIA)
+    for call_args in langfuse_client.create_score.call_args_list:
+        assert call_args[1]["trace_id"] == "trace-abc-001"
+        assert call_args[1]["name"] in CRITERIA
+
+    assert "scores" in result
+    assert "confidence" in result
+    assert "criteria" in result
+    assert len(result["criteria"]) == len(CRITERIA)
+    assert result["llm_answer"] == "direct answer"
+    assert result["fetch_count"] == 0
 
 
 # ---------------------------------------------------------------------------

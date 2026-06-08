@@ -1,0 +1,108 @@
+/opt/miniconda3/lib/python3.13/site-packages/pytest_asyncio/plugin.py:247: PytestDeprecationWarning: The configuration option "asyncio_default_fixture_loop_scope" is unset.
+The event loop scope for asynchronous fixtures will default to the fixture caching scope. Future versions of pytest-asyncio will default the loop scope for asynchronous fixtures to function scope. Set the default fixture loop scope explicitly in order to avoid unexpected behavior in the future. Valid fixture loop scopes are: "function", "class", "module", "package", "session"
+
+  warnings.warn(PytestDeprecationWarning(_DEFAULT_FIXTURE_LOOP_SCOPE_UNSET))
+============================= test session starts ==============================
+platform darwin -- Python 3.13.5, pytest-9.0.2, pluggy-1.5.0 -- /opt/miniconda3/bin/python
+cachedir: .pytest_cache
+rootdir: /Users/obtuse/gitRepos/trustOpsBack
+configfile: pyproject.toml
+plugins: respx-0.22.0, httpx-0.36.0, xonsh-0.23.7, asyncio-1.3.0, anyio-4.13.0
+asyncio: mode=Mode.AUTO, debug=False, asyncio_default_fixture_loop_scope=None, asyncio_default_test_loop_scope=function
+collecting ... collected 86 items / 1 deselected / 85 selected
+
+tests/test_evaluator.py::test_load_dataset PASSED                        [  1%]
+tests/test_evaluator.py::test_load_dataset_field_mapping PASSED          [  2%]
+tests/test_evaluator.py::test_load_dataset_all_korean PASSED             [  3%]
+tests/test_evaluator.py::test_dataset_answer_token_overlap_is_low PASSED [  4%]
+tests/test_evaluator.py::test_dataset_context_nontrivial_length PASSED   [  5%]
+tests/test_evaluator.py::test_dataset_question_asks_something PASSED     [  7%]
+tests/test_evaluator.py::test_load_dataset_backward_compat PASSED        [  8%]
+tests/test_evaluator.py::test_load_dataset_active_fetch PASSED           [  9%]
+tests/test_evaluator.py::test_run_evaluation_writes_commit_and_workflow_metadata PASSED [ 10%]
+tests/test_evaluator.py::test_run_evaluation_malformed_input_fails_without_artifact PASSED [ 11%]
+tests/test_evaluator.py::test_batch_judge_prompt_contains_all_criteria PASSED [ 12%]
+tests/test_evaluator.py::test_batch_judge_prompt_contains_independence_instruction PASSED [ 14%]
+tests/test_evaluator.py::test_batch_judge_prompt_contains_criterion_rubric PASSED [ 15%]
+tests/test_evaluator.py::test_batch_judge_prompt_faithfulness_rubric PASSED [ 16%]
+tests/test_evaluator.py::test_batch_judge_prompt_safety_rubric PASSED    [ 17%]
+tests/test_evaluator.py::test_batch_judge_parse_valid_response PASSED    [ 18%]
+tests/test_evaluator.py::test_batch_judge_parse_missing_key_raises PASSED [ 20%]
+tests/test_evaluator.py::test_batch_judge_parse_truncated_json_raises PASSED [ 21%]
+tests/test_evaluator.py::test_batch_judge_parse_think_tags_stripped PASSED [ 22%]
+tests/test_evaluator.py::test_batch_judge_parse_string_booleans_coerced PASSED [ 23%]
+tests/test_evaluator.py::test_batch_judge_parse_extra_keys_ignored PASSED [ 24%]
+tests/test_evaluator.py::test_evaluate_sample_returns_result PASSED      [ 25%]
+tests/test_evaluator.py::test_unexpected_token PASSED                    [ 27%]
+tests/test_evaluator.py::test_rate_limiting PASSED                       [ 28%]
+tests/test_evaluator.py::test_evaluate_sample_index_preserved PASSED     [ 29%]
+tests/test_evaluator.py::test_evaluate_sample_all_criteria_scored PASSED [ 30%]
+tests/test_evaluator.py::test_evaluate_sample_batch_uses_reasoning_only_response PASSED [ 31%]
+tests/test_evaluator.py::test_evaluate_sample_batch_makes_two_calls PASSED [ 32%]
+tests/test_evaluator.py::test_evaluate_sample_batch_retry_on_parse_failure PASSED [ 34%]
+tests/test_evaluator.py::test_evaluate_sample_batch_hard_error_after_retry PASSED [ 35%]
+tests/test_evaluator.py::test_call_llm_signature_unchanged PASSED        [ 36%]
+tests/test_evaluator.py::test_call_llm_messages_sends_tools PASSED       [ 37%]
+tests/test_evaluator.py::test_call_llm_passes_extra_headers PASSED       [ 38%]
+tests/test_evaluator.py::test_call_llm_without_extra_headers_unchanged PASSED [ 40%]
+tests/test_evaluator.py::test_call_llm_messages_passes_extra_headers PASSED [ 41%]
+tests/test_evaluator.py::test_call_llm_messages_without_extra_headers_unchanged PASSED [ 42%]
+tests/test_evaluator.py::test_tool_call_capability_failure_message PASSED [ 43%]
+tests/test_evaluator.py::test_active_fetch_loop_terminates PASSED        [ 44%]
+tests/test_evaluator.py::test_active_fetch_max_iterations PASSED         [ 45%]
+tests/test_evaluator.py::test_active_fetch_rejects_unknown_tool PASSED   [ 47%]
+tests/test_evaluator.py::test_active_fetch_no_fetch_compliance PASSED    [ 48%]
+tests/test_evaluator.py::test_active_fetch_gold_doc_recall PASSED        [ 49%]
+tests/test_evaluator.py::test_active_fetch_gold_doc_recall_no_gold PASSED [ 50%]
+tests/test_evaluator.py::test_active_fetch_output_schema PASSED          [ 51%]
+tests/test_evaluator.py::test_static_output_schema_unchanged PASSED      [ 52%]
+tests/test_evaluator.py::test_mode_defaults_to_static PASSED             [ 54%]
+tests/test_evaluator.py::test_active_fetch_runs_capability_check PASSED  [ 55%]
+tests/test_evaluator.py::test_run_evaluation_static_regression PASSED    [ 56%]
+tests/test_evaluator.py::test_static_mode_unchanged PASSED               [ 57%]
+tests/test_evaluator.py::test_run_evaluation_active_fetch_e2e PASSED     [ 58%]
+tests/test_evaluator.py::test_active_fetch_creates_langfuse_trace PASSED [ 60%]
+tests/test_evaluator.py::test_active_fetch_langfuse_none_no_crash PASSED [ 61%]
+tests/test_evaluator.py::test_active_fetch_no_tool_call_still_traced PASSED [ 62%]
+tests/test_evaluator.py::test_active_fetch_no_tool_call_first_iteration_traced PASSED [ 63%]
+tests/test_evaluator.py::test_active_fetch_judge_uses_skip_header PASSED [ 64%]
+tests/test_evaluator.py::test_active_fetch_records_judge_observation PASSED [ 65%]
+tests/test_evaluator.py::test_active_fetch_records_scores_or_summary PASSED [ 67%]
+tests/test_evaluator.py::test_active_fetch_with_langfuse_none_still_suppresses_backend_when_requested PASSED [ 68%]
+tests/test_evaluator.py::test_active_fetch_no_double_recording PASSED    [ 69%]
+tests/test_langfuse_scores.py::TestPushScores::test_push_scores_called_5_times PASSED [ 70%]
+tests/test_langfuse_scores.py::TestPushScores::test_score_names_match_criteria_exactly PASSED [ 71%]
+tests/test_langfuse_scores.py::TestPushScores::test_all_scores_numeric_data_type PASSED [ 72%]
+tests/test_langfuse_scores.py::TestPushScores::test_trace_created_per_sample PASSED [ 74%]
+tests/test_langfuse_scores.py::TestPushScores::test_flush_called_after_push PASSED [ 75%]
+tests/test_langfuse_scores.py::TestPushScores::test_trace_id_passed_to_create_score PASSED [ 76%]
+tests/test_langfuse_scores.py::TestPushScores::test_langfuse_environments_are_tagged PASSED [ 77%]
+tests/test_langfuse_scores.py::TestNoLangfuse::test_no_langfuse_skips_push PASSED [ 78%]
+tests/test_langfuse_scores.py::TestNoLangfuse::test_cli_no_langfuse_arg_produces_no_calls PASSED [ 80%]
+tests/test_langfuse_scores.py::TestLLMReachable::test_llm_reachable_mock PASSED [ 81%]
+tests/test_langfuse_scores.py::TestIntegrationEndToEnd::test_integration_end_to_end_trace_name PASSED [ 82%]
+tests/test_langfuse_scores.py::TestIntegrationEndToEnd::test_integration_end_to_end_10_scores_per_sample PASSED [ 83%]
+tests/test_langfuse_scores.py::TestIntegrationEndToEnd::test_integration_trace_input_has_question PASSED [ 84%]
+tests/test_langfuse_scores.py::TestIntegrationEndToEnd::test_criteria_names_are_lowercase_underscore PASSED [ 85%]
+tests/test_canary_tracing.py::test_trace_version_non_streaming PASSED    [ 87%]
+tests/test_canary_tracing.py::test_trace_version_streaming PASSED        [ 88%]
+tests/test_canary_tracing.py::test_backward_compat PASSED                [ 89%]
+tests/test_canary_tracing.py::test_version_in_tags PASSED                [ 90%]
+tests/test_canary_tracing.py::test_no_tags_when_no_version PASSED        [ 91%]
+tests/test_canary_tracing.py::test_x_skip_langfuse_not_forwarded_upstream PASSED [ 92%]
+tests/test_canary_tracing.py::test_active_fetch_skips_backend_recording PASSED [ 94%]
+tests/test_canary_tracing.py::test_backend_records_normally_without_skip_header PASSED [ 95%]
+tests/test_canary_tracing.py::test_x_skip_langfuse_true_case_insensitive[TRUE] PASSED [ 96%]
+tests/test_canary_tracing.py::test_x_skip_langfuse_true_case_insensitive[True] PASSED [ 97%]
+tests/test_canary_tracing.py::test_x_skip_langfuse_true_case_insensitive[true] PASSED [ 98%]
+tests/test_canary_tracing.py::test_x_skip_langfuse_streaming_suppresses_record_stream_and_usage_injection PASSED [100%]
+
+=============================== warnings summary ===============================
+tests/test_langfuse_scores.py::TestIntegrationEndToEnd::test_integration_end_to_end_trace_name
+  /opt/miniconda3/lib/python3.13/unittest/mock.py:2247: RuntimeWarning: coroutine 'run_evaluation' was never awaited
+    def __init__(self, name, parent):
+  Enable tracemalloc to get traceback where the object was allocated.
+  See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+================= 85 passed, 1 deselected, 1 warning in 0.49s ==================

@@ -145,3 +145,48 @@ This is a controlled, reproducible benchmark, not a production RAG system.
 - Maximum of 5 tool iterations (`MAX_TOOL_ITERATIONS = 5`). If the model has
   not produced a final answer by then, the loop terminates and
   `loop_terminated_early` is set to true.
+
+## Observability
+
+The evaluator reports scores to Langfuse. The approach differs by mode.
+
+### Static mode
+
+Uses `push_scores_to_langfuse()` unchanged. Each sample creates a Langfuse
+observation and per-criterion numeric scores. The backend records its own
+LLM call traces normally. No changes to this flow were made.
+
+### Active-fetch mode (evaluator-owned tracing)
+
+The evaluator process owns one Langfuse trace per sample. The trace hierarchy
+looks like this:
+
+```
+Trace: rag-active-fetch-sample_{i}
+  └─ Span: rag-active-fetch-sample
+       ├─ Generation: active_fetch.iteration_1.llm
+       ├─ Span:      active_fetch.iteration_1.fetch_materials
+       ├─ Generation: active_fetch.iteration_2.llm
+       ├─ Span:      active_fetch.iteration_2.fetch_materials
+       ├─ ...
+       └─ Generation: rag-active-fetch-judge
+            └─ per-criterion scores (faithfulness, relevance, safety, etc.)
+```
+
+Each LLM call and tool invocation gets its own observation under the parent
+sample span. The judge generation carries per-criterion numeric scores.
+
+### Backend suppression
+
+Every evaluator-originated LLM request (model turns, judge call) includes
+the header `X-Skip-Langfuse: true` to prevent double-reporting. The backend
+reads this header and skips its own Langfuse recording for those requests.
+The backend also blocks this header from being forwarded upstream via
+`BLOCKED_HEADERS`. Normal application traffic (non-evaluator requests)
+records traces as usual.
+
+### Testing and verification
+
+All observability assertions use mocked Langfuse clients, not a live
+dashboard. No manual dashboard verification is required to validate the
+tracing behavior.
