@@ -17,6 +17,7 @@ from eval.evaluator import (
     SampleResult,
     JudgeResponseParseError,
     _build_parser,
+    _evaluate_active_fetch_sample_with_tracing,
     build_active_fetch_output_record,
     build_batch_judge_prompt,
     call_llm,
@@ -1218,3 +1219,251 @@ async def test_active_fetch_no_tool_call_still_traced():
     # No fetch observation since there were no tool calls
     obs_mock.update.assert_called_once()
     obs_mock.end.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# Active-fetch tracing helper tests
+# ---------------------------------------------------------------------------
+
+
+async def test_active_fetch_judge_uses_skip_header():
+    """Verify that judge call_llm receives X-Skip-Langfuse header."""
+    sample = EvalSample(question="test q", context="", expected_answer="test a")
+    mock_af_result = {
+        "sample_id": "sample_0",
+        "question": "test q",
+        "expected_answer": "test a",
+        "llm_answer": "final answer",
+        "tool_calls": [],
+        "fetched_doc_ids": [],
+        "fetched_text": "some context",
+        "fetch_count": 0,
+        "loop_terminated_early": False,
+    }
+
+    langfuse_client = MagicMock()
+    parent_obs = MagicMock()
+    parent_obs.id = "parent-obs-001"
+    langfuse_client.start_observation.return_value = parent_obs
+
+    with patch("eval.evaluator._propagate_attributes", return_value=MagicMock()):
+        with patch(
+            "eval.evaluator.evaluate_sample_active_fetch", new_callable=AsyncMock
+        ) as mock_active:
+            mock_active.return_value = mock_af_result
+            with patch(
+                "eval.evaluator.call_llm", new_callable=AsyncMock
+            ) as mock_call_llm:
+                mock_call_llm.return_value = _BATCH_PASS_RESPONSE
+
+                await _evaluate_active_fetch_sample_with_tracing(
+                    sample,
+                    0,
+                    llm_endpoint="http://test",
+                    evaluation_langfuse_client=langfuse_client,
+                )
+
+    assert mock_call_llm.call_count == 1
+    call_kwargs = mock_call_llm.call_args[1]
+    assert call_kwargs.get("extra_headers") == {"X-Skip-Langfuse": "true"}
+
+
+async def test_active_fetch_records_judge_observation():
+    """Verify that a judge observation is created under the same trace context."""
+    sample = EvalSample(question="test q", context="", expected_answer="test a")
+    mock_af_result = {
+        "sample_id": "sample_0",
+        "question": "test q",
+        "expected_answer": "test a",
+        "llm_answer": "final answer",
+        "tool_calls": [],
+        "fetched_doc_ids": [],
+        "fetched_text": "some context",
+        "fetch_count": 0,
+        "loop_terminated_early": False,
+    }
+
+    langfuse_client = MagicMock()
+    parent_obs = MagicMock()
+    parent_obs.id = "parent-obs-001"
+    judge_obs = MagicMock()
+    judge_obs.id = "judge-obs-001"
+    langfuse_client.start_observation.side_effect = [parent_obs, judge_obs]
+
+    with patch("eval.evaluator._propagate_attributes", return_value=MagicMock()):
+        with patch(
+            "eval.evaluator.evaluate_sample_active_fetch", new_callable=AsyncMock
+        ) as mock_active:
+            mock_active.return_value = mock_af_result
+            with patch(
+                "eval.evaluator.call_llm", new_callable=AsyncMock
+            ) as mock_call_llm:
+                mock_call_llm.return_value = _BATCH_PASS_RESPONSE
+
+                await _evaluate_active_fetch_sample_with_tracing(
+                    sample,
+                    0,
+                    llm_endpoint="http://test",
+                    evaluation_langfuse_client=langfuse_client,
+                )
+
+    obs_calls = langfuse_client.start_observation.call_args_list
+    judge_calls = [
+        c for c in obs_calls if c[1].get("name") == "rag-active-fetch-judge"
+    ]
+    assert len(judge_calls) == 1
+    assert judge_calls[0][1]["as_type"] == "generation"
+    assert "prompt" in judge_calls[0][1]["input"]
+
+
+async def test_active_fetch_records_scores_or_summary():
+    """Verify that create_score is called with correct trace_id per criterion."""
+    sample = EvalSample(question="test q", context="", expected_answer="test a")
+    mock_af_result = {
+        "sample_id": "sample_0",
+        "question": "test q",
+        "expected_answer": "test a",
+        "llm_answer": "final answer",
+        "tool_calls": [],
+        "fetched_doc_ids": [],
+        "fetched_text": "some context",
+        "fetch_count": 0,
+        "loop_terminated_early": False,
+    }
+
+    langfuse_client = MagicMock()
+    parent_obs = MagicMock()
+    parent_obs.id = "parent-obs-001"
+    parent_obs.trace_id = "trace-abc-001"
+    langfuse_client.start_observation.return_value = parent_obs
+
+    with patch("eval.evaluator._propagate_attributes", return_value=MagicMock()):
+        with patch(
+            "eval.evaluator.evaluate_sample_active_fetch", new_callable=AsyncMock
+        ) as mock_active:
+            mock_active.return_value = mock_af_result
+            with patch(
+                "eval.evaluator.call_llm", new_callable=AsyncMock
+            ) as mock_call_llm:
+                mock_call_llm.return_value = _BATCH_PASS_RESPONSE
+
+                result = await _evaluate_active_fetch_sample_with_tracing(
+                    sample,
+                    0,
+                    llm_endpoint="http://test",
+                    evaluation_langfuse_client=langfuse_client,
+                )
+
+    # create_score must be called once per criterion with the correct trace_id
+    assert langfuse_client.create_score.call_count == len(CRITERIA)
+    for call_args in langfuse_client.create_score.call_args_list:
+        assert call_args[1]["trace_id"] == "trace-abc-001"
+        assert call_args[1]["name"] in CRITERIA
+        assert call_args[1]["data_type"] == "NUMERIC"
+
+    # Result dict must carry scores, confidence, and criteria for the caller
+    assert "scores" in result
+    assert "confidence" in result
+    assert "criteria" in result
+    assert len(result["criteria"]) == len(CRITERIA)
+
+
+async def test_active_fetch_with_langfuse_none_still_suppresses_backend_when_requested():
+    """Verify skip header is sent even when evaluation_langfuse_client is None."""
+    sample = EvalSample(question="test q", context="", expected_answer="test a")
+    mock_af_result = {
+        "sample_id": "sample_0",
+        "question": "test q",
+        "expected_answer": "test a",
+        "llm_answer": "final answer",
+        "tool_calls": [],
+        "fetched_doc_ids": [],
+        "fetched_text": "some context",
+        "fetch_count": 0,
+        "loop_terminated_early": False,
+    }
+
+    with patch(
+        "eval.evaluator.evaluate_sample_active_fetch", new_callable=AsyncMock
+    ) as mock_active:
+        mock_active.return_value = mock_af_result
+        with patch(
+            "eval.evaluator.call_llm", new_callable=AsyncMock
+        ) as mock_call_llm:
+            mock_call_llm.return_value = _BATCH_PASS_RESPONSE
+
+            result = await _evaluate_active_fetch_sample_with_tracing(
+                sample,
+                0,
+                llm_endpoint="http://test",
+                evaluation_langfuse_client=None,
+            )
+
+    # call_llm must still send the skip header without a langfuse client
+    assert mock_call_llm.call_count == 1
+    call_kwargs = mock_call_llm.call_args[1]
+    assert call_kwargs.get("extra_headers") == {"X-Skip-Langfuse": "true"}
+
+    # evaluate_sample_active_fetch must still be called with suppress_backend_langfuse
+    assert mock_active.call_count == 1
+    active_kwargs = mock_active.call_args[1]
+    assert active_kwargs.get("suppress_backend_langfuse") is True
+
+    # Result must include scores/confidence even without langfuse
+    assert "scores" in result
+    assert "confidence" in result
+    assert "criteria" in result
+
+
+async def test_active_fetch_no_double_recording():
+    """Verify call_llm for the judge does NOT carry Langfuse params that would
+    cause double recording (evaluator creates its own judge observation instead)."""
+    sample = EvalSample(question="test q", context="", expected_answer="test a")
+    mock_af_result = {
+        "sample_id": "sample_0",
+        "question": "test q",
+        "expected_answer": "test a",
+        "llm_answer": "final answer",
+        "tool_calls": [],
+        "fetched_doc_ids": [],
+        "fetched_text": "some context",
+        "fetch_count": 0,
+        "loop_terminated_early": False,
+    }
+
+    langfuse_client = MagicMock()
+    parent_obs = MagicMock()
+    parent_obs.id = "parent-obs-001"
+    langfuse_client.start_observation.return_value = parent_obs
+
+    with patch("eval.evaluator._propagate_attributes", return_value=MagicMock()):
+        with patch(
+            "eval.evaluator.evaluate_sample_active_fetch", new_callable=AsyncMock
+        ) as mock_active:
+            mock_active.return_value = mock_af_result
+            with patch(
+                "eval.evaluator.call_llm", new_callable=AsyncMock
+            ) as mock_call_llm:
+                mock_call_llm.return_value = _BATCH_PASS_RESPONSE
+
+                await _evaluate_active_fetch_sample_with_tracing(
+                    sample,
+                    0,
+                    llm_endpoint="http://test",
+                    evaluation_langfuse_client=langfuse_client,
+                )
+
+    # Judge call_llm must NOT receive langfuse params that would trigger its
+    # own observation creation — the helper creates a separate judge observation.
+    assert mock_call_llm.call_count == 1
+    call_kwargs = mock_call_llm.call_args[1]
+    assert call_kwargs.get("extra_headers") == {"X-Skip-Langfuse": "true"}
+    assert call_kwargs.get("langfuse_client") is None
+    assert call_kwargs.get("langfuse_trace_name") is None
+
+    # The evaluator's Langfuse client should create exactly 2 observations:
+    # one parent span and one judge generation — NOT a third one via call_llm.
+    obs_calls = langfuse_client.start_observation.call_args_list
+    names = [c[1].get("name") for c in obs_calls]
+    assert "rag-active-fetch-sample" in names
+    assert "rag-active-fetch-judge" in names

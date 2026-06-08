@@ -9,12 +9,21 @@ import os
 import re
 import sys
 import time as _time
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 import httpx
 from eval.retriever import fetch_materials
+
+# Lazily-imported reference to langfuse.propagate_attributes for active-fetch tracing.
+_propagate_attributes: Any | None = None
+try:
+    _langfuse_module = importlib.import_module("langfuse")
+    _propagate_attributes = getattr(_langfuse_module, "propagate_attributes", None)
+except ImportError:
+    pass
 
 logger = logging.getLogger("eval.evaluator")
 
@@ -804,6 +813,174 @@ async def evaluate_sample_active_fetch(
     }
 
 
+async def _evaluate_active_fetch_sample_with_tracing(
+    sample: EvalSample,
+    sample_index: int,
+    *,
+    llm_endpoint: str,
+    model: str = "default",
+    semaphore: asyncio.Semaphore | None = None,
+    request_timeout: float = DEFAULT_LLM_TIMEOUT_SECONDS,
+    corpus_dir: Path | None = None,
+    evaluation_langfuse_client: Any | None = None,
+    evaluation_langfuse_environment: str | None = None,
+    commit_sha: str | None = None,
+    workflow_uid: str | None = None,
+    dataset_path: str | None = None,
+) -> dict[str, Any]:
+    """Evaluate a single active-fetch sample with evaluator-owned Langfuse tracing.
+
+    Creates one evaluator-owned trace per sample (via ``propagate_attributes``),
+    a parent sample observation, child tool-loop/fetch/judge observations, and
+    per-criterion score observations.  Every evaluator-originated LLM request
+    carries ``X-Skip-Langfuse: true`` to suppress backend recording.
+
+    Returns the active-fetch result dict enriched with ``scores``, ``confidence``,
+    and ``criteria`` (a ``list[CriterionResult]``) keys so the caller can build
+    a ``SampleResult`` without re-parsing the judge response.
+    """
+    sample_trace_name = f"rag-active-fetch-sample_{sample_index}"
+    use_tracing = (
+        evaluation_langfuse_client is not None
+        and _propagate_attributes is not None
+    )
+
+    if use_tracing:
+        cm = _propagate_attributes(
+            trace_name=sample_trace_name,
+            metadata={
+                "mode": "active_fetch",
+                "sample_id": f"sample_{sample_index}",
+            },
+            tags=["mode:active_fetch"],
+        )
+    else:
+        cm = nullcontext()
+
+    active_fetch_parent_observation_id: str | None = None
+    active_fetch_score_trace_id: str | None = None
+    parent_obs: Any | None = None
+
+    with cm:
+        if use_tracing:
+            parent_obs = evaluation_langfuse_client.start_observation(
+                name="rag-active-fetch-sample",
+                as_type="span",
+                input={
+                    "question": sample.question,
+                    "expected_answer": sample.expected_answer,
+                },
+                metadata={
+                    "mode": "active_fetch",
+                    "sample_id": f"sample_{sample_index}",
+                    "active_fetch_trace_name": sample_trace_name,
+                },
+            )
+            active_fetch_parent_observation_id = parent_obs.id
+            active_fetch_score_trace_id = getattr(
+                parent_obs, "trace_id", sample_trace_name
+            )
+
+        af_result = await evaluate_sample_active_fetch(
+            sample,
+            sample_index,
+            llm_endpoint=llm_endpoint,
+            model=model,
+            semaphore=semaphore,
+            request_timeout=request_timeout,
+            corpus_dir=corpus_dir,
+            langfuse_client=evaluation_langfuse_client if use_tracing else None,
+            active_fetch_trace_name=sample_trace_name if use_tracing else None,
+            active_fetch_parent_observation_id=active_fetch_parent_observation_id,
+            suppress_backend_langfuse=True,
+        )
+
+        # Judge evaluation
+        judge_context = af_result.get("fetched_text", "")
+        judge_prompt = build_batch_judge_prompt(
+            question=sample.question,
+            context=judge_context,
+            expected_answer=sample.expected_answer,
+            response=af_result["llm_answer"],
+        )
+
+        # Judge observation (under same trace context, not via call_llm's built-in)
+        judge_obs: Any | None = None
+        if use_tracing:
+            judge_obs = _start_active_fetch_observation(
+                evaluation_langfuse_client,
+                name="rag-active-fetch-judge",
+                as_type="generation",
+                input_data={"prompt": judge_prompt},
+                metadata={
+                    "mode": "active_fetch",
+                    "sample_id": f"sample_{sample_index}",
+                },
+            )
+
+        judge_response = await call_llm(
+            judge_prompt,
+            endpoint=llm_endpoint,
+            model=model,
+            max_tokens=JUDGE_MAX_TOKENS,
+            timeout=request_timeout,
+            temperature=0,
+            extra_headers={"X-Skip-Langfuse": "true"},
+        )
+
+        if judge_obs is not None:
+            _safe_update_observation(
+                judge_obs,
+                output={"response": judge_response},
+            )
+            _safe_end_observation(judge_obs)
+
+        batch_verdicts = parse_batch_judge_response(judge_response)
+
+        # Build criteria list and score/confidence maps
+        scores_dict: dict[str, float] = {}
+        confidence_dict: dict[str, float] = {}
+        criteria_list: list[CriterionResult] = []
+        for criterion_name in CRITERIA:
+            passed = batch_verdicts[criterion_name]
+            crit = CriterionResult(
+                criterion=criterion_name,
+                passed=passed,
+                confidence=1.0 if passed else 0.0,
+                score=1.0 if passed else 0.0,
+            )
+            scores_dict[criterion_name] = crit.score
+            confidence_dict[criterion_name] = crit.confidence
+            criteria_list.append(crit)
+
+        # Create per-criterion score observations under the same trace
+        if use_tracing:
+            for crit in criteria_list:
+                try:
+                    evaluation_langfuse_client.create_score(
+                        trace_id=active_fetch_score_trace_id,
+                        name=crit.criterion,
+                        value=crit.score,
+                        data_type="NUMERIC",
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "Failed to create score for %s: %s",
+                        crit.criterion,
+                        exc,
+                    )
+
+        # End parent observation
+        if parent_obs is not None:
+            _safe_end_observation(parent_obs)
+
+    # Enrich the result dict so the caller can build a SampleResult directly
+    af_result["scores"] = scores_dict
+    af_result["confidence"] = confidence_dict
+    af_result["criteria"] = criteria_list
+    return af_result
+
+
 def compute_fetch_metrics(
     fetch_count: int,
     fetched_doc_ids: list[str],
@@ -865,6 +1042,7 @@ async def run_evaluation(
     dry_run: bool = False,
     request_timeout: float = DEFAULT_LLM_TIMEOUT_SECONDS,
     evaluation_langfuse_client: Any | None = None,
+    evaluation_langfuse_environment: str | None = None,
     judge_langfuse_client: Any | None = None,
     mode: str = "static",
     corpus_dir: str = "eval/corpus",
@@ -925,7 +1103,7 @@ async def run_evaluation(
             corpus_path = Path(corpus_dir)
             for i, sample in enumerate(samples):
                 logger.info("Evaluating sample %d/%d (active_fetch)", i + 1, len(samples))
-                af_result = await evaluate_sample_active_fetch(
+                af_result = await _evaluate_active_fetch_sample_with_tracing(
                     sample,
                     sample_index=i,
                     llm_endpoint=llm_endpoint,
@@ -933,26 +1111,13 @@ async def run_evaluation(
                     semaphore=semaphore,
                     request_timeout=request_timeout,
                     corpus_dir=corpus_path,
+                    evaluation_langfuse_client=evaluation_langfuse_client,
+                    evaluation_langfuse_environment=evaluation_langfuse_environment,
+                    commit_sha=commit_sha,
+                    workflow_uid=workflow_uid,
+                    dataset_path=dataset_path,
                 )
                 af_results.append(af_result)
-
-                # Judge evaluation against fetched materials
-                judge_context = af_result.get("fetched_text", "")
-                judge_prompt = build_batch_judge_prompt(
-                    question=sample.question,
-                    context=judge_context,
-                    expected_answer=sample.expected_answer,
-                    response=af_result["llm_answer"],
-                )
-                judge_response = await call_llm(
-                    judge_prompt,
-                    endpoint=llm_endpoint,
-                    model=model,
-                    max_tokens=JUDGE_MAX_TOKENS,
-                    timeout=request_timeout,
-                    temperature=0,
-                )
-                batch_verdicts = parse_batch_judge_response(judge_response)
 
                 sr = SampleResult(
                     sample_id=af_result["sample_id"],
@@ -960,17 +1125,8 @@ async def run_evaluation(
                     context="",
                     expected_answer=af_result["expected_answer"],
                     llm_answer=af_result["llm_answer"],
+                    criteria=af_result["criteria"],
                 )
-                for criterion_name in CRITERIA:
-                    passed = batch_verdicts[criterion_name]
-                    sr.criteria.append(
-                        CriterionResult(
-                            criterion=criterion_name,
-                            passed=passed,
-                            confidence=1.0 if passed else 0.0,
-                            score=1.0 if passed else 0.0,
-                        )
-                    )
                 eval_result.samples.append(sr)
         else:
             for i, sample in enumerate(samples):
