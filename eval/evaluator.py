@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any
 
 import httpx
+from eval.retriever import fetch_materials
 
 logger = logging.getLogger("eval.evaluator")
 
@@ -71,6 +72,7 @@ MAX_CONCURRENT_LLM_CALLS = 1
 DEFAULT_LLM_TIMEOUT_SECONDS = 600.0
 EVALUATION_MAX_TOKENS = 56_000
 JUDGE_MAX_TOKENS = 1024
+MAX_TOOL_ITERATIONS = 5
 
 
 @dataclass
@@ -78,6 +80,7 @@ class EvalSample:
     question: str
     context: str
     expected_answer: str
+    gold_doc_ids: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -116,6 +119,7 @@ def load_dataset(path: str) -> list[EvalSample]:
                     question=data["question"],
                     context=data["context"],
                     expected_answer=data["expected_answer"],
+                    gold_doc_ids=data.get("gold_doc_ids", []),
                 )
             )
     return samples
@@ -189,6 +193,99 @@ async def call_llm(
             logger.warning("Failed to log Langfuse trace for %s: %s", langfuse_trace_name, exc)
 
     return response_json
+
+
+FETCH_MATERIALS_TOOL: dict[str, Any] = {
+    "type": "function",
+    "function": {
+        "name": "fetch_materials",
+        "description": "Fetch relevant benchmark materials by natural-language query.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "Natural-language search query for benchmark materials.",
+                },
+                "top_k": {
+                    "type": "integer",
+                    "description": "Maximum number of documents to return.",
+                },
+            },
+            "required": ["query"],
+            "additionalProperties": False,
+        },
+    },
+}
+
+
+async def call_llm_messages(
+    messages: list[dict[str, Any]],
+    *,
+    endpoint: str,
+    model: str = "default",
+    max_tokens: int = 1,
+    timeout: float = DEFAULT_LLM_TIMEOUT_SECONDS,
+    tools: list[dict[str, Any]] | None = None,
+    tool_choice: str | dict[str, Any] | None = None,
+    **kwargs: Any,
+) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "model": model,
+        "messages": messages,
+        "max_tokens": max_tokens,
+        **kwargs,
+    }
+    if tools is not None:
+        payload["tools"] = tools
+    if tool_choice is not None:
+        payload["tool_choice"] = tool_choice
+    url = f"{endpoint.rstrip('/')}/v1/chat/completions"
+    async with httpx.AsyncClient(timeout=httpx.Timeout(timeout)) as client:
+        response = await client.post(url, json=payload)
+        response.raise_for_status()
+        return response.json()
+
+
+async def check_tool_call_capability(
+    *,
+    endpoint: str,
+    model: str = "default",
+    timeout: float = 30.0,
+) -> None:
+    """Raise RuntimeError if endpoint does not support tool calling."""
+    test_messages = [
+        {"role": "user", "content": "Search for materials about testing."},
+    ]
+    try:
+        result = await call_llm_messages(
+            test_messages,
+            endpoint=endpoint,
+            model=model,
+            max_tokens=100,
+            timeout=timeout,
+            tools=[FETCH_MATERIALS_TOOL],
+            tool_choice={"type": "function", "function": {"name": "fetch_materials"}},
+        )
+        choices = result.get("choices", [])
+        if not choices:
+            raise RuntimeError(
+                "Tool calling not supported: empty choices in response. "
+                "The active_fetch mode requires an endpoint that supports OpenAI-compatible tool calling."
+            )
+        msg = choices[0].get("message", {})
+        if not msg.get("tool_calls"):
+            raise RuntimeError(
+                "Tool calling not supported by this model endpoint. "
+                "The active_fetch mode requires the model to respond with tool_calls "
+                "when given the fetch_materials tool. "
+                "Ensure your vLLM/model endpoint supports OpenAI-compatible function calling."
+            )
+    except httpx.HTTPStatusError as exc:
+        raise RuntimeError(
+            f"Tool calling capability check failed with HTTP {exc.response.status_code}. "
+            f"The active_fetch mode requires an endpoint that supports OpenAI-compatible tool calling."
+        ) from exc
 
 
 def build_batch_judge_prompt(
@@ -438,6 +535,177 @@ async def evaluate_sample(
     return sample_result
 
 
+async def evaluate_sample_active_fetch(
+    sample: EvalSample,
+    sample_index: int,
+    *,
+    llm_endpoint: str,
+    model: str = "default",
+    semaphore: asyncio.Semaphore | None = None,
+    request_timeout: float = DEFAULT_LLM_TIMEOUT_SECONDS,
+    corpus_dir: Path | None = None,
+) -> dict[str, Any]:
+    """Evaluate a sample using active fetch — the model fetches its own materials via tool calls."""
+    if corpus_dir is None:
+        corpus_dir = Path("eval/corpus")
+    if semaphore is None:
+        semaphore = asyncio.Semaphore(MAX_CONCURRENT_LLM_CALLS)
+
+    messages: list[dict[str, Any]] = [
+        {"role": "user", "content": sample.question},
+    ]
+
+    tool_calls_log: list[dict[str, str]] = []
+    fetched_doc_ids: set[str] = set()
+    fetched_text: str = ""
+    fetch_count: int = 0
+    loop_terminated_early: bool = False
+    final_answer: str = ""
+
+    for iteration in range(MAX_TOOL_ITERATIONS):
+        async with semaphore:
+            response = await call_llm_messages(
+                messages,
+                endpoint=llm_endpoint,
+                model=model,
+                max_tokens=EVALUATION_MAX_TOKENS,
+                timeout=request_timeout,
+                tools=[FETCH_MATERIALS_TOOL],
+            )
+
+        choices = response.get("choices", [])
+        if not choices:
+            break
+
+        choice = choices[0]
+        message = choice.get("message", {})
+        finish_reason = choice.get("finish_reason", "")
+        tool_calls = message.get("tool_calls")
+
+        if not tool_calls:
+            final_answer = message.get("content", "") or ""
+            break
+
+        # Append the assistant message (with tool_calls) to history
+        messages.append(message)
+
+        for tc in tool_calls:
+            tc_id = tc.get("id", "")
+            function_info = tc.get("function", {})
+            func_name = function_info.get("name", "")
+            func_args_str = function_info.get("arguments", "{}")
+
+            tool_calls_log.append({"name": func_name, "arguments": func_args_str})
+
+            if func_name != "fetch_materials":
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": tc_id,
+                    "content": json.dumps({"error": f"Unknown tool: {func_name}"}),
+                })
+            else:
+                try:
+                    args = json.loads(func_args_str)
+                except json.JSONDecodeError:
+                    args = {}
+
+                query = args.get("query", "")
+                top_k = args.get("top_k", 3)
+                if not isinstance(top_k, int) or top_k < 1:
+                    top_k = 3
+                top_k = min(top_k, 5)
+
+                results = fetch_materials(query, top_k, corpus_dir)
+
+                fetch_count += 1
+                for r in results:
+                    fetched_doc_ids.add(r.doc_id)
+                    if fetched_text:
+                        fetched_text += "\n\n"
+                    fetched_text += r.passage
+
+                serialized = [
+                    {
+                        "doc_id": r.doc_id,
+                        "title": r.title,
+                        "passage": r.passage,
+                        "score": r.score,
+                        "path": str(r.path),
+                    }
+                    for r in results
+                ]
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": tc_id,
+                    "content": json.dumps(serialized),
+                })
+
+        if iteration == MAX_TOOL_ITERATIONS - 1:
+            loop_terminated_early = True
+
+    return {
+        "sample_id": f"sample_{sample_index}",
+        "question": sample.question,
+        "expected_answer": sample.expected_answer,
+        "llm_answer": final_answer,
+        "tool_calls": tool_calls_log,
+        "fetched_doc_ids": sorted(fetched_doc_ids),
+        "fetched_text": fetched_text,
+        "fetch_count": fetch_count,
+        "loop_terminated_early": loop_terminated_early,
+    }
+
+
+def compute_fetch_metrics(
+    fetch_count: int,
+    fetched_doc_ids: list[str],
+    gold_doc_ids: list[str],
+) -> dict[str, Any]:
+    """Compute fetch-related metrics: compliance, recall, and count."""
+    must_fetch_compliance = fetch_count > 0
+    if gold_doc_ids:
+        gold_set = set(gold_doc_ids)
+        fetched_set = set(fetched_doc_ids)
+        gold_doc_recall = len(gold_set & fetched_set) / len(gold_set)
+    else:
+        gold_doc_recall = None
+    return {
+        "fetch_count": fetch_count,
+        "must_fetch_compliance": must_fetch_compliance,
+        "gold_doc_recall": gold_doc_recall,
+    }
+
+
+def build_active_fetch_output_record(
+    af_result: dict[str, Any],
+    *,
+    gold_doc_ids: list[str],
+    commit_sha: str | None,
+    workflow_uid: str | None,
+    dataset_path: str,
+    model: str,
+) -> dict[str, Any]:
+    """Build the output record for an active-fetch evaluation sample."""
+    metrics = compute_fetch_metrics(
+        af_result["fetch_count"],
+        af_result["fetched_doc_ids"],
+        gold_doc_ids,
+    )
+    return {
+        "sample_id": af_result["sample_id"],
+        "commit_sha": commit_sha,
+        "workflow_uid": workflow_uid,
+        "dataset_path": dataset_path,
+        "model_id": model,
+        "mode": "active_fetch",
+        "tool_calls": af_result["tool_calls"],
+        "fetched_doc_ids": af_result["fetched_doc_ids"],
+        "fetch_metrics": metrics,
+        "loop_terminated_early": af_result["loop_terminated_early"],
+        "llm_answer": af_result["llm_answer"],
+    }
+
+
 async def run_evaluation(
     dataset_path: str,
     llm_endpoint: str,
@@ -450,12 +718,15 @@ async def run_evaluation(
     request_timeout: float = DEFAULT_LLM_TIMEOUT_SECONDS,
     evaluation_langfuse_client: Any | None = None,
     judge_langfuse_client: Any | None = None,
+    mode: str = "static",
+    corpus_dir: str = "eval/corpus",
 ) -> EvalResult:
     semaphore = asyncio.Semaphore(MAX_CONCURRENT_LLM_CALLS)
     samples = load_dataset(dataset_path)
     logger.info("Loaded %d samples from %s", len(samples), dataset_path)
 
     eval_result = EvalResult()
+    af_results: list[dict[str, Any]] = []
 
     if dry_run:
         logger.info(
@@ -464,6 +735,20 @@ async def run_evaluation(
             llm_endpoint,
         )
         for i, sample in enumerate(samples):
+            if mode == "active_fetch":
+                af_results.append(
+                    {
+                        "sample_id": f"sample_{i}",
+                        "question": sample.question,
+                        "expected_answer": sample.expected_answer,
+                        "llm_answer": "[DRY RUN]",
+                        "tool_calls": [],
+                        "fetched_doc_ids": [],
+                        "fetched_text": "",
+                        "fetch_count": 0,
+                        "loop_terminated_early": False,
+                    }
+                )
             eval_result.samples.append(
                 SampleResult(
                     sample_id=f"sample_{i}",
@@ -483,27 +768,101 @@ async def run_evaluation(
                 )
             )
     else:
-        for i, sample in enumerate(samples):
-            logger.info("Evaluating sample %d/%d", i + 1, len(samples))
-            sr = await evaluate_sample(
-                sample,
-                sample_index=i,
-                llm_endpoint=llm_endpoint,
+        if mode == "active_fetch":
+            await check_tool_call_capability(
+                endpoint=llm_endpoint,
                 model=model,
-                semaphore=semaphore,
-                request_timeout=request_timeout,
-                evaluation_langfuse_client=evaluation_langfuse_client,
-                judge_langfuse_client=judge_langfuse_client,
+                timeout=request_timeout,
             )
-            eval_result.samples.append(sr)
+            corpus_path = Path(corpus_dir)
+            for i, sample in enumerate(samples):
+                logger.info("Evaluating sample %d/%d (active_fetch)", i + 1, len(samples))
+                af_result = await evaluate_sample_active_fetch(
+                    sample,
+                    sample_index=i,
+                    llm_endpoint=llm_endpoint,
+                    model=model,
+                    semaphore=semaphore,
+                    request_timeout=request_timeout,
+                    corpus_dir=corpus_path,
+                )
+                af_results.append(af_result)
+
+                # Judge evaluation against fetched materials
+                judge_context = af_result.get("fetched_text", "")
+                judge_prompt = build_batch_judge_prompt(
+                    question=sample.question,
+                    context=judge_context,
+                    expected_answer=sample.expected_answer,
+                    response=af_result["llm_answer"],
+                )
+                judge_response = await call_llm(
+                    judge_prompt,
+                    endpoint=llm_endpoint,
+                    model=model,
+                    max_tokens=JUDGE_MAX_TOKENS,
+                    timeout=request_timeout,
+                    temperature=0,
+                )
+                batch_verdicts = parse_batch_judge_response(judge_response)
+
+                sr = SampleResult(
+                    sample_id=af_result["sample_id"],
+                    question=af_result["question"],
+                    context="",
+                    expected_answer=af_result["expected_answer"],
+                    llm_answer=af_result["llm_answer"],
+                )
+                for criterion_name in CRITERIA:
+                    passed = batch_verdicts[criterion_name]
+                    sr.criteria.append(
+                        CriterionResult(
+                            criterion=criterion_name,
+                            passed=passed,
+                            confidence=1.0 if passed else 0.0,
+                            score=1.0 if passed else 0.0,
+                        )
+                    )
+                eval_result.samples.append(sr)
+        else:
+            for i, sample in enumerate(samples):
+                logger.info("Evaluating sample %d/%d", i + 1, len(samples))
+                sr = await evaluate_sample(
+                    sample,
+                    sample_index=i,
+                    llm_endpoint=llm_endpoint,
+                    model=model,
+                    semaphore=semaphore,
+                    request_timeout=request_timeout,
+                    evaluation_langfuse_client=evaluation_langfuse_client,
+                    judge_langfuse_client=judge_langfuse_client,
+                )
+                eval_result.samples.append(sr)
 
     output_records = []
-    for s in eval_result.samples:
-        scores = {c.criterion: c.score for c in s.criteria}
-        confidence = {c.criterion: c.confidence for c in s.criteria}
-        overall_score = sum(scores.values()) / len(scores) if scores else 0.0
-        output_records.append(
-            {
+    for i, s in enumerate(eval_result.samples):
+        if mode == "active_fetch" and i < len(af_results):
+            record = build_active_fetch_output_record(
+                af_results[i],
+                gold_doc_ids=samples[i].gold_doc_ids,
+                commit_sha=commit_sha,
+                workflow_uid=workflow_uid,
+                dataset_path=dataset_path,
+                model=model,
+            )
+            # Include judge criteria results in the output record
+            scores = {c.criterion: c.score for c in s.criteria}
+            confidence = {c.criterion: c.confidence for c in s.criteria}
+            overall_score = sum(scores.values()) / len(scores) if scores else 0.0
+            record["scores"] = scores
+            record["confidence"] = confidence
+            record["overall_score"] = overall_score
+            record["passed"] = all(c.passed for c in s.criteria)
+        else:
+            scores = {c.criterion: c.score for c in s.criteria}
+            confidence = {c.criterion: c.confidence for c in s.criteria}
+            overall_score = sum(scores.values()) / len(scores) if scores else 0.0
+            record = {
                 "sample_id": s.sample_id,
                 "commit_sha": commit_sha,
                 "workflow_uid": workflow_uid,
@@ -515,7 +874,7 @@ async def run_evaluation(
                 "passed": all(c.passed for c in s.criteria),
                 "llm_answer": s.llm_answer,
             }
-        )
+        output_records.append(record)
     Path(output_path).parent.mkdir(parents=True, exist_ok=True)
     with open(output_path, "w", encoding="utf-8") as fh:
         json.dump(output_records, fh, ensure_ascii=False, indent=2)
@@ -651,6 +1010,18 @@ def _build_parser() -> argparse.ArgumentParser:
         default=None,
         help=f"Per-request timeout in seconds (default: {int(DEFAULT_LLM_TIMEOUT_SECONDS)}).",
     )
+    parser.add_argument(
+        "--mode",
+        choices=["static", "active_fetch"],
+        default="static",
+        help="Evaluation mode: 'static' (default) injects context into prompt; 'active_fetch' lets the model fetch materials via tool calls.",
+    )
+    parser.add_argument(
+        "--corpus-dir",
+        metavar="DIR",
+        default="eval/corpus",
+        help="Path to directory containing markdown corpus files for active_fetch mode (default: eval/corpus).",
+    )
     return parser
 
 
@@ -713,6 +1084,8 @@ def main() -> None:
             request_timeout=request_timeout,
             evaluation_langfuse_client=evaluation_langfuse_client,
             judge_langfuse_client=judge_langfuse_client,
+            mode=args.mode,
+            corpus_dir=args.corpus_dir,
         )
     )
 

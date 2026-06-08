@@ -4,23 +4,35 @@ import asyncio
 import json
 import re
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from eval.evaluator import (
     CRITERIA,
+    CriterionResult,
+    FETCH_MATERIALS_TOOL,
     EvalSample,
+    MAX_TOOL_ITERATIONS,
     SampleResult,
     JudgeResponseParseError,
+    _build_parser,
+    build_active_fetch_output_record,
     build_batch_judge_prompt,
-    parse_batch_judge_response,
+    call_llm,
+    call_llm_messages,
+    check_tool_call_capability,
+    compute_fetch_metrics,
     evaluate_sample,
+    evaluate_sample_active_fetch,
     load_dataset,
+    parse_batch_judge_response,
     run_evaluation,
 )
+from eval.retriever import FetchResult
 
 EVAL_DATA_PATH = Path(__file__).parent.parent / "eval" / "eval_data.jsonl"
+ACTIVE_FETCH_DATA_PATH = Path(__file__).parent.parent / "eval" / "eval_data_active_fetch.jsonl"
 
 _BATCH_PASS_RESPONSE = {
     "choices": [
@@ -139,6 +151,23 @@ def test_dataset_question_asks_something():
     samples = load_dataset(str(EVAL_DATA_PATH))
     for sample in samples:
         assert "?" in sample.question or sample.question.endswith("요?")
+
+
+def test_load_dataset_backward_compat():
+    samples = load_dataset(str(EVAL_DATA_PATH))
+    for sample in samples:
+        assert isinstance(sample, EvalSample)
+        assert sample.gold_doc_ids == []
+
+
+def test_load_dataset_active_fetch():
+    samples = load_dataset(str(ACTIVE_FETCH_DATA_PATH))
+    assert len(samples) == 5
+    for sample in samples:
+        assert isinstance(sample, EvalSample)
+        assert sample.context == ""
+        assert len(sample.gold_doc_ids) > 0
+        assert isinstance(sample.gold_doc_ids[0], str)
 
 
 async def test_run_evaluation_writes_commit_and_workflow_metadata(tmp_path: Path):
@@ -473,3 +502,463 @@ async def test_evaluate_sample_batch_hard_error_after_retry():
             await evaluate_sample(sample, 0, llm_endpoint="http://localhost:8080", semaphore=semaphore)
 
     assert call_count == 3
+
+
+async def test_call_llm_signature_unchanged():
+    mock_response = MagicMock()
+    mock_response.json = MagicMock(return_value={"choices": [{"message": {"content": "ok"}}]})
+
+    mock_client = MagicMock()
+    mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+    mock_client.__aexit__ = AsyncMock(return_value=None)
+    mock_client.post = AsyncMock(return_value=mock_response)
+
+    with patch("eval.evaluator.httpx.AsyncClient", return_value=mock_client):
+        result = await call_llm("test prompt", endpoint="http://test", model="m")
+
+    call_kwargs = mock_client.post.call_args[1]
+    payload = call_kwargs["json"]
+    assert payload["messages"] == [{"role": "user", "content": "test prompt"}]
+    assert "tools" not in payload
+    assert result == {"choices": [{"message": {"content": "ok"}}]}
+
+
+async def test_call_llm_messages_sends_tools():
+    mock_response = MagicMock()
+    mock_response.json = MagicMock(return_value={"choices": [{"message": {"content": "ok"}}]})
+
+    mock_client = MagicMock()
+    mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+    mock_client.__aexit__ = AsyncMock(return_value=None)
+    mock_client.post = AsyncMock(return_value=mock_response)
+
+    messages = [{"role": "user", "content": "test"}]
+    with patch("eval.evaluator.httpx.AsyncClient", return_value=mock_client):
+        result = await call_llm_messages(
+            messages,
+            endpoint="http://test",
+            model="m",
+            tools=[FETCH_MATERIALS_TOOL],
+            tool_choice="auto",
+        )
+
+    call_kwargs = mock_client.post.call_args[1]
+    payload = call_kwargs["json"]
+    assert "tools" in payload
+    assert payload["tools"] == [FETCH_MATERIALS_TOOL]
+    assert "tool_choice" in payload
+    assert payload["tool_choice"] == "auto"
+    assert payload["messages"] == [{"role": "user", "content": "test"}]
+    assert result == {"choices": [{"message": {"content": "ok"}}]}
+
+
+async def test_tool_call_capability_failure_message():
+    mock_response = {"choices": [{"message": {"content": "I can help"}}]}
+
+    with patch("eval.evaluator.call_llm_messages", AsyncMock(return_value=mock_response)):
+        with pytest.raises(RuntimeError) as exc_info:
+            await check_tool_call_capability(endpoint="http://test")
+
+    err = str(exc_info.value)
+    assert "tool calling" in err.lower()
+    assert "active_fetch" in err
+
+
+async def test_active_fetch_loop_terminates():
+    sample = EvalSample(question="test q", context="", expected_answer="test a")
+
+    tool_calls_response = {
+        "choices": [{
+            "finish_reason": "tool_calls",
+            "message": {
+                "tool_calls": [{
+                    "id": "tc1",
+                    "type": "function",
+                    "function": {
+                        "name": "fetch_materials",
+                        "arguments": '{"query": "test", "top_k": 3}',
+                    },
+                }],
+            },
+        }]
+    }
+
+    stop_response = {
+        "choices": [{
+            "finish_reason": "stop",
+            "message": {"content": "final answer"},
+        }]
+    }
+
+    mock_fetch_result = FetchResult(
+        doc_id="doc1", title="t", passage="p", score=1.0, path=Path("/tmp/d"),
+    )
+
+    with patch("eval.evaluator.call_llm_messages", new_callable=AsyncMock) as mock_llm:
+        mock_llm.side_effect = [tool_calls_response, stop_response]
+        with patch("eval.evaluator.fetch_materials", return_value=[mock_fetch_result]):
+            result = await evaluate_sample_active_fetch(sample, 0, llm_endpoint="http://test")
+
+    assert mock_llm.call_count == 2
+    assert result["llm_answer"] == "final answer"
+    assert result["fetch_count"] == 1
+    assert result["fetched_doc_ids"] == ["doc1"]
+    assert result["loop_terminated_early"] is False
+
+
+async def test_active_fetch_max_iterations():
+    sample = EvalSample(question="q", context="", expected_answer="e")
+
+    tool_calls_response = {
+        "choices": [{
+            "finish_reason": "tool_calls",
+            "message": {
+                "tool_calls": [{
+                    "id": "tc1",
+                    "type": "function",
+                    "function": {
+                        "name": "fetch_materials",
+                        "arguments": '{"query": "test", "top_k": 3}',
+                    },
+                }],
+            },
+        }]
+    }
+
+    mock_fetch = MagicMock(return_value=[
+        FetchResult(doc_id="doc1", title="t", passage="p", score=1.0, path=Path("/tmp/d")),
+    ])
+
+    with patch("eval.evaluator.call_llm_messages", new_callable=AsyncMock) as mock_llm:
+        mock_llm.side_effect = [tool_calls_response] * MAX_TOOL_ITERATIONS
+        with patch("eval.evaluator.fetch_materials", mock_fetch):
+            result = await evaluate_sample_active_fetch(sample, 0, llm_endpoint="http://test")
+
+    assert result["loop_terminated_early"] is True
+    assert result["fetch_count"] == MAX_TOOL_ITERATIONS
+    assert mock_llm.call_count == MAX_TOOL_ITERATIONS
+
+
+async def test_active_fetch_rejects_unknown_tool():
+    sample = EvalSample(question="q", context="", expected_answer="e")
+
+    evil_tool_response = {
+        "choices": [{
+            "finish_reason": "tool_calls",
+            "message": {
+                "tool_calls": [{
+                    "id": "evil1",
+                    "type": "function",
+                    "function": {
+                        "name": "evil_tool",
+                        "arguments": '{"malicious": true}',
+                    },
+                }],
+            },
+        }]
+    }
+
+    stop_response = {
+        "choices": [{
+            "finish_reason": "stop",
+            "message": {"content": "safe answer"},
+        }]
+    }
+
+    with patch("eval.evaluator.call_llm_messages", new_callable=AsyncMock) as mock_llm:
+        mock_llm.side_effect = [evil_tool_response, stop_response]
+        with patch("eval.evaluator.fetch_materials") as mock_fetch:
+            result = await evaluate_sample_active_fetch(sample, 0, llm_endpoint="http://test")
+
+    assert result["fetch_count"] == 0
+    assert mock_fetch.call_count == 0
+    assert result["llm_answer"] == "safe answer"
+    assert len(result["tool_calls"]) == 1
+    assert result["tool_calls"][0]["name"] == "evil_tool"
+
+
+def test_active_fetch_no_fetch_compliance():
+    metrics = compute_fetch_metrics(
+        fetch_count=0, fetched_doc_ids=[], gold_doc_ids=["doc_a"]
+    )
+    assert metrics["must_fetch_compliance"] is False
+    assert metrics["gold_doc_recall"] == 0.0
+    assert metrics["fetch_count"] == 0
+
+
+def test_active_fetch_gold_doc_recall():
+    metrics = compute_fetch_metrics(
+        fetch_count=2,
+        fetched_doc_ids=["doc_a", "doc_b"],
+        gold_doc_ids=["doc_a", "doc_c"],
+    )
+    assert metrics["gold_doc_recall"] == 0.5
+    assert metrics["must_fetch_compliance"] is True
+    assert metrics["fetch_count"] == 2
+
+
+def test_active_fetch_gold_doc_recall_no_gold():
+    metrics = compute_fetch_metrics(
+        fetch_count=1, fetched_doc_ids=["doc_a"], gold_doc_ids=[]
+    )
+    assert metrics["gold_doc_recall"] is None
+    assert metrics["must_fetch_compliance"] is True
+    assert metrics["fetch_count"] == 1
+
+
+def test_active_fetch_output_schema():
+    af_result = {
+        "sample_id": "sample_0",
+        "question": "test?",
+        "expected_answer": "test answer",
+        "llm_answer": "final answer",
+        "tool_calls": [{"name": "fetch_materials", "arguments": '{"query": "test"}'}],
+        "fetched_doc_ids": ["doc_a"],
+        "fetched_text": "some content",
+        "fetch_count": 1,
+        "loop_terminated_early": False,
+    }
+    record = build_active_fetch_output_record(
+        af_result,
+        gold_doc_ids=["doc_a"],
+        commit_sha="abc123",
+        workflow_uid="wf-001",
+        dataset_path="test_dataset",
+        model="test-model",
+    )
+    assert record["mode"] == "active_fetch"
+    assert record["fetched_doc_ids"] == ["doc_a"]
+    assert record["tool_calls"] == af_result["tool_calls"]
+    assert record["loop_terminated_early"] is False
+    assert record["llm_answer"] == "final answer"
+    assert record["sample_id"] == "sample_0"
+    assert record["commit_sha"] == "abc123"
+    assert record["workflow_uid"] == "wf-001"
+    assert record["dataset_path"] == "test_dataset"
+    assert record["model_id"] == "test-model"
+
+    metrics = record["fetch_metrics"]
+    assert "fetch_count" in metrics
+    assert "must_fetch_compliance" in metrics
+    assert "gold_doc_recall" in metrics
+    assert metrics["fetch_count"] == 1
+    assert metrics["must_fetch_compliance"] is True
+    assert metrics["gold_doc_recall"] == 1.0
+
+
+def test_static_output_schema_unchanged():
+    sample_result = SampleResult(
+        sample_id="sample_0",
+        question="test?",
+        context="test context",
+        expected_answer="test answer",
+        llm_answer="final answer",
+        criteria=[
+            CriterionResult(criterion="faithfulness", passed=True, confidence=1.0, score=1.0),
+            CriterionResult(criterion="relevance", passed=True, confidence=1.0, score=1.0),
+            CriterionResult(criterion="safety", passed=True, confidence=1.0, score=1.0),
+            CriterionResult(criterion="format_tone", passed=False, confidence=0.5, score=0.0),
+            CriterionResult(criterion="context_precision", passed=True, confidence=1.0, score=1.0),
+        ],
+    )
+    scores = {c.criterion: c.score for c in sample_result.criteria}
+    confidence = {c.criterion: c.confidence for c in sample_result.criteria}
+    overall_score = sum(scores.values()) / len(scores) if scores else 0.0
+    record = {
+        "sample_id": sample_result.sample_id,
+        "commit_sha": None,
+        "workflow_uid": None,
+        "dataset_path": "test",
+        "model_id": "test",
+        "scores": scores,
+        "confidence": confidence,
+        "overall_score": overall_score,
+        "passed": all(c.passed for c in sample_result.criteria),
+        "llm_answer": sample_result.llm_answer,
+    }
+
+    assert "mode" not in record
+    assert "tool_calls" not in record
+    assert "fetched_doc_ids" not in record
+    assert "fetch_metrics" not in record
+    assert "loop_terminated_early" not in record
+
+
+def test_mode_defaults_to_static():
+    parser = _build_parser()
+    args = parser.parse_args(["--input", "test.jsonl", "--output", "test.json"])
+    assert args.mode == "static"
+    assert args.corpus_dir == "eval/corpus"
+
+
+async def test_active_fetch_runs_capability_check(tmp_path):
+    dataset_path = tmp_path / "dataset.jsonl"
+    dataset_path.write_text(
+        '{"question":"What is K3s?","context":"","expected_answer":"lightweight k8s"}\n',
+        encoding="utf-8",
+    )
+    output_path = tmp_path / "results.json"
+
+    tool_calls_response = {
+        "choices": [{
+            "finish_reason": "tool_calls",
+            "message": {
+                "tool_calls": [{
+                    "id": "tc1",
+                    "type": "function",
+                    "function": {
+                        "name": "fetch_materials",
+                        "arguments": '{"query": "test", "top_k": 3}',
+                    },
+                }],
+            },
+        }]
+    }
+    stop_response = {
+        "choices": [{
+            "finish_reason": "stop",
+            "message": {"content": "final answer"},
+        }]
+    }
+
+    with patch("eval.evaluator.check_tool_call_capability", new_callable=AsyncMock) as mock_check:
+        with patch("eval.evaluator.call_llm_messages", new_callable=AsyncMock) as mock_llm:
+            mock_llm.side_effect = [tool_calls_response, stop_response]
+            with patch("eval.evaluator.fetch_materials", return_value=[]):
+                with patch("eval.evaluator.call_llm", new_callable=AsyncMock) as mock_call_llm:
+                    mock_call_llm.return_value = _BATCH_PASS_RESPONSE
+                    await run_evaluation(
+                        str(dataset_path),
+                        llm_endpoint="http://localhost:8080",
+                        output_path=str(output_path),
+                        model="test-model",
+                        dry_run=False,
+                        mode="active_fetch",
+                        corpus_dir=tmp_path,
+                    )
+
+    mock_check.assert_awaited_once()
+
+
+async def test_run_evaluation_static_regression(tmp_path: Path) -> None:
+    dataset_path = tmp_path / "dataset.jsonl"
+    dataset_path.write_text(
+        '{"question":"What is K3s?","context":"K3s is a lightweight Kubernetes distribution.","expected_answer":"K3s is lightweight Kubernetes."}\n',
+        encoding="utf-8",
+    )
+    output_path = tmp_path / "results.json"
+
+    async def mock_call(prompt: str, *, endpoint: str, **kwargs: object) -> dict:
+        return _BATCH_PASS_RESPONSE
+
+    with patch("eval.evaluator.call_llm", side_effect=mock_call) as mock_cl:
+        with patch("eval.evaluator.evaluate_sample_active_fetch") as mock_active:
+            await run_evaluation(
+                str(dataset_path),
+                llm_endpoint="http://localhost:8080",
+                output_path=str(output_path),
+                model="test-model",
+                dry_run=False,
+            )
+
+    mock_active.assert_not_called()
+    assert mock_cl.call_count == 2
+
+    payload = json.loads(output_path.read_text(encoding="utf-8"))
+    assert len(payload) == 1
+    record = payload[0]
+    assert "scores" in record
+    assert "confidence" in record
+    assert "overall_score" in record
+    assert "passed" in record
+    assert "llm_answer" in record
+    assert "mode" not in record
+    assert "fetched_doc_ids" not in record
+    assert "fetch_metrics" not in record
+    assert "tool_calls" not in record
+    assert "loop_terminated_early" not in record
+
+
+async def test_run_evaluation_active_fetch_e2e(tmp_path: Path) -> None:
+    dataset_path = tmp_path / "dataset.jsonl"
+    dataset_path.write_text(
+        '{"question":"What is K3s?","context":"","expected_answer":"lightweight K3s","gold_doc_ids":["doc1"]}\n',
+        encoding="utf-8",
+    )
+    output_path = tmp_path / "results.json"
+
+    tool_calls_response = {
+        "choices": [{
+            "finish_reason": "tool_calls",
+            "message": {
+                "tool_calls": [{
+                    "id": "tc1",
+                    "type": "function",
+                    "function": {
+                        "name": "fetch_materials",
+                        "arguments": '{"query": "test", "top_k": 3}',
+                    },
+                }],
+            },
+        }]
+    }
+
+    stop_response = {
+        "choices": [{
+            "finish_reason": "stop",
+            "message": {"content": "final answer"},
+        }]
+    }
+
+    mock_fetch_result = FetchResult(
+        doc_id="doc1", title="t", passage="p", score=1.0, path=Path("/tmp/d"),
+    )
+
+    with patch("eval.evaluator.call_llm_messages", new_callable=AsyncMock) as mock_llm:
+        mock_llm.side_effect = [
+            tool_calls_response,  # check_tool_call_capability
+            tool_calls_response,  # evaluate_sample_active_fetch iteration 0 (tool call)
+            stop_response,        # evaluate_sample_active_fetch iteration 1 (stop)
+        ]
+        with patch("eval.evaluator.fetch_materials", return_value=[mock_fetch_result]):
+            with patch("eval.evaluator.call_llm", new_callable=AsyncMock) as mock_call_llm:
+                mock_call_llm.return_value = _BATCH_PASS_RESPONSE
+                await run_evaluation(
+                    str(dataset_path),
+                    llm_endpoint="http://localhost:8080",
+                    output_path=str(output_path),
+                    model="test-model",
+                    dry_run=False,
+                    mode="active_fetch",
+                    corpus_dir=str(tmp_path),
+                )
+
+    payload = json.loads(output_path.read_text(encoding="utf-8"))
+    assert len(payload) == 1
+    record = payload[0]
+
+    assert record["mode"] == "active_fetch"
+    assert record["fetched_doc_ids"] == ["doc1"]
+    assert record["tool_calls"] == [
+        {"name": "fetch_materials", "arguments": '{"query": "test", "top_k": 3}'},
+    ]
+    assert record["loop_terminated_early"] is False
+    assert record["llm_answer"] == "final answer"
+
+    metrics = record["fetch_metrics"]
+    assert metrics["fetch_count"] == 1
+    assert metrics["must_fetch_compliance"] is True
+    assert metrics["gold_doc_recall"] == 1.0
+
+    # Verify judge criteria are now included in active_fetch output
+    assert "scores" in record
+    assert record["scores"] == {criterion: 1.0 for criterion in CRITERIA}
+    assert "confidence" in record
+    assert record["confidence"] == {criterion: 1.0 for criterion in CRITERIA}
+    assert "overall_score" in record
+    assert record["overall_score"] == 1.0
+    assert "passed" in record
+    assert record["passed"] is True
+
+    assert record["model_id"] == "test-model"
+    assert record["dataset_path"] == str(dataset_path)

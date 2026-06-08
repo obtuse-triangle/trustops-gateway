@@ -1,0 +1,5 @@
+{"question": "K3s에서 ArgoCD 동기화가 자꾸 어긋날 때 무엇부터 살펴봐야 하나요?", "context": "", "expected_answer": "처음엔 연결 흐름과 인증 단서를 함께 보고, 단일 원인으로 섣불리 단정하지 않는 태도가 맞습니다.", "gold_doc_ids": ["argocd-k3s-sync"]}
+{"question": "두 정책이 서로 다를 때 지금은 어느 기준을 따라야 하나요?", "context": "", "expected_answer": "뒤쪽 개정본의 30일 규정을 따릅니다.", "gold_doc_ids": ["retention-policy"]}
+{"question": "그럼 취소하면 바로 환불되나요?", "context": "", "expected_answer": "아니요, 갱신 조항이 붙은 경우에만 예외로 처리됩니다.", "gold_doc_ids": ["refund-cancellation"]}
+{"question": "이 사용자의 문제는 무엇이었나요?", "context": "", "expected_answer": "접속 절차가 끝까지 완주되지 못한 상태였습니다.", "gold_doc_ids": ["support-ticket"]}
+{"question": "금융 거래 기록은 몇 년 남기나요?", "context": "", "expected_answer": "감사 대상 항목은 훨씬 긴 보존 주기를 탑니다.", "gold_doc_ids": ["transaction-retention"]}
