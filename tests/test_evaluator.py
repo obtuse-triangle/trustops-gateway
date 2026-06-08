@@ -552,6 +552,92 @@ async def test_call_llm_messages_sends_tools():
     assert result == {"choices": [{"message": {"content": "ok"}}]}
 
 
+async def test_call_llm_passes_extra_headers():
+    mock_response = MagicMock()
+    mock_response.json = MagicMock(return_value={"choices": [{"message": {"content": "ok"}}]})
+
+    mock_client = MagicMock()
+    mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+    mock_client.__aexit__ = AsyncMock(return_value=None)
+    mock_client.post = AsyncMock(return_value=mock_response)
+
+    with patch("eval.evaluator.httpx.AsyncClient", return_value=mock_client):
+        result = await call_llm(
+            "test prompt",
+            endpoint="http://test",
+            model="m",
+            extra_headers={"X-Skip-Langfuse": "true"},
+        )
+
+    call_kwargs = mock_client.post.call_args[1]
+    assert "headers" in call_kwargs
+    assert call_kwargs["headers"]["X-Skip-Langfuse"] == "true"
+    assert result == {"choices": [{"message": {"content": "ok"}}]}
+
+
+async def test_call_llm_without_extra_headers_unchanged():
+    mock_response = MagicMock()
+    mock_response.json = MagicMock(return_value={"choices": [{"message": {"content": "ok"}}]})
+
+    mock_client = MagicMock()
+    mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+    mock_client.__aexit__ = AsyncMock(return_value=None)
+    mock_client.post = AsyncMock(return_value=mock_response)
+
+    with patch("eval.evaluator.httpx.AsyncClient", return_value=mock_client):
+        result = await call_llm("test prompt", endpoint="http://test", model="m")
+
+    call_kwargs = mock_client.post.call_args[1]
+    assert "headers" not in call_kwargs
+    assert result == {"choices": [{"message": {"content": "ok"}}]}
+
+
+async def test_call_llm_messages_passes_extra_headers():
+    mock_response = MagicMock()
+    mock_response.json = MagicMock(return_value={"choices": [{"message": {"content": "ok"}}]})
+
+    mock_client = MagicMock()
+    mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+    mock_client.__aexit__ = AsyncMock(return_value=None)
+    mock_client.post = AsyncMock(return_value=mock_response)
+
+    messages = [{"role": "user", "content": "test"}]
+    with patch("eval.evaluator.httpx.AsyncClient", return_value=mock_client):
+        result = await call_llm_messages(
+            messages,
+            endpoint="http://test",
+            model="m",
+            extra_headers={"X-Skip-Langfuse": "true"},
+        )
+
+    call_kwargs = mock_client.post.call_args[1]
+    assert "headers" in call_kwargs
+    assert call_kwargs["headers"]["X-Skip-Langfuse"] == "true"
+    assert result == {"choices": [{"message": {"content": "ok"}}]}
+
+
+async def test_call_llm_messages_without_extra_headers_unchanged():
+    mock_response = MagicMock()
+    mock_response.json = MagicMock(return_value={"choices": [{"message": {"content": "ok"}}]})
+
+    mock_client = MagicMock()
+    mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+    mock_client.__aexit__ = AsyncMock(return_value=None)
+    mock_client.post = AsyncMock(return_value=mock_response)
+
+    messages = [{"role": "user", "content": "test"}]
+    with patch("eval.evaluator.httpx.AsyncClient", return_value=mock_client):
+        result = await call_llm_messages(
+            messages,
+            endpoint="http://test",
+            model="m",
+        )
+
+    call_kwargs = mock_client.post.call_args[1]
+    assert "headers" not in call_kwargs
+    assert result == {"choices": [{"message": {"content": "ok"}}]}
+
+
 async def test_tool_call_capability_failure_message():
     mock_response = {"choices": [{"message": {"content": "I can help"}}]}
 

@@ -19,7 +19,7 @@ from app.settings import Settings
 logger = logging.getLogger("trustopsback")
 
 BLOCKED_HEADERS = {"host", "content-length",
-                   "connection", "accept-encoding", "x-gateway-api-key"}
+                   "connection", "accept-encoding", "x-gateway-api-key", "x-skip-langfuse"}
 NO_BUFFER_HEADERS = {"content-length",
                      "transfer-encoding", "connection", "content-encoding"}
 USER_HEADER_CANDIDATES = ("x-user-id", "x-end-user-id", "x-gateway-user-id")
@@ -155,6 +155,7 @@ async def proxy_request(
     body = await read_request_body(request, settings)
   params = dict(request.query_params)
   headers = forward_headers(request)
+  skip_langfuse = request.headers.get("x-skip-langfuse", "").strip().lower() == "true"
   start = time.perf_counter()
 
   request_json: Any = request_json_override
@@ -196,7 +197,7 @@ async def proxy_request(
   # Inject stream_options.include_usage so vLLM appends a usage chunk at the end
   # of every streaming response. Without this, token counts are never available.
   upstream_body: bytes = body
-  if is_streaming_request and isinstance(request_json, dict) and langfuse is not None:
+  if is_streaming_request and isinstance(request_json, dict) and langfuse is not None and not skip_langfuse:
     patched = dict(request_json)
     stream_options = dict(patched.get("stream_options") or {})
     stream_options["include_usage"] = True
@@ -265,7 +266,7 @@ async def proxy_request(
       finally:
         duration_ms = (time.perf_counter() - start) * 1000
         _langfuse = langfuse
-        if path.startswith("/v1/") and isinstance(request_json, dict) and _langfuse is not None and response_buffer:
+        if path.startswith("/v1/") and isinstance(request_json, dict) and _langfuse is not None and response_buffer and not skip_langfuse:
           response_text = response_buffer.decode("utf-8", errors="replace")
           _recorder = _langfuse
           loop = asyncio.get_event_loop()
@@ -319,7 +320,7 @@ async def proxy_request(
     response_error = HTTPException(
       status_code=502, detail="Upstream response too large")
 
-  if path.startswith("/v1/") and isinstance(request_json, dict) and langfuse is not None:
+  if path.startswith("/v1/") and isinstance(request_json, dict) and langfuse is not None and not skip_langfuse:
     langfuse.record(
         path=path,
         method=request.method,

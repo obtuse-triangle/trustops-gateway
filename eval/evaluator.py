@@ -138,6 +138,7 @@ async def call_llm(
     langfuse_environment: str | None = None,
     langfuse_trace_name: str | None = None,
     langfuse_metadata: dict[str, Any] | None = None,
+    extra_headers: dict[str, str] | None = None,
     **kwargs: Any,
 ) -> dict[str, Any]:
     payload: dict[str, Any] = {
@@ -151,7 +152,10 @@ async def call_llm(
     url = f"{endpoint.rstrip('/')}/v1/chat/completions"
     async with httpx.AsyncClient(timeout=httpx.Timeout(timeout)) as client:
         start_time_perf = _time.perf_counter()
-        response = await client.post(url, json=payload)
+        if extra_headers:
+            response = await client.post(url, json=payload, headers=extra_headers)
+        else:
+            response = await client.post(url, json=payload)
         response.raise_for_status()
         response_json = response.json()
         duration_ms = (_time.perf_counter() - start_time_perf) * 1000.0
@@ -228,6 +232,7 @@ async def call_llm_messages(
     timeout: float = DEFAULT_LLM_TIMEOUT_SECONDS,
     tools: list[dict[str, Any]] | None = None,
     tool_choice: str | dict[str, Any] | None = None,
+    extra_headers: dict[str, str] | None = None,
     **kwargs: Any,
 ) -> dict[str, Any]:
     payload: dict[str, Any] = {
@@ -242,7 +247,10 @@ async def call_llm_messages(
         payload["tool_choice"] = tool_choice
     url = f"{endpoint.rstrip('/')}/v1/chat/completions"
     async with httpx.AsyncClient(timeout=httpx.Timeout(timeout)) as client:
-        response = await client.post(url, json=payload)
+        if extra_headers:
+            response = await client.post(url, json=payload, headers=extra_headers)
+        else:
+            response = await client.post(url, json=payload)
         response.raise_for_status()
         return response.json()
 
