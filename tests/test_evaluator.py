@@ -1048,3 +1048,173 @@ async def test_run_evaluation_active_fetch_e2e(tmp_path: Path) -> None:
 
     assert record["model_id"] == "test-model"
     assert record["dataset_path"] == str(dataset_path)
+
+
+async def test_active_fetch_creates_langfuse_trace():
+    sample = EvalSample(question="test q", context="", expected_answer="test a")
+
+    tool_calls_response = {
+        "choices": [{
+            "finish_reason": "tool_calls",
+            "message": {
+                "tool_calls": [{
+                    "id": "tc1",
+                    "type": "function",
+                    "function": {
+                        "name": "fetch_materials",
+                        "arguments": '{"query": "test", "top_k": 3}',
+                    },
+                }],
+            },
+        }]
+    }
+    stop_response = {
+        "choices": [{
+            "finish_reason": "stop",
+            "message": {"content": "final answer"},
+        }]
+    }
+
+    mock_fetch_result = FetchResult(
+        doc_id="doc1", title="t", passage="p", score=1.0, path=Path("/tmp/d"),
+    )
+
+    langfuse_client = MagicMock()
+    obs_mock = MagicMock()
+    obs_mock.id = "obs-001"
+    langfuse_client.start_observation.return_value = obs_mock
+
+    with patch("eval.evaluator.call_llm_messages", new_callable=AsyncMock) as mock_llm:
+        mock_llm.side_effect = [tool_calls_response, stop_response]
+        with patch("eval.evaluator.fetch_materials", return_value=[mock_fetch_result]):
+            result = await evaluate_sample_active_fetch(
+                sample, 0,
+                llm_endpoint="http://test",
+                langfuse_client=langfuse_client,
+                active_fetch_trace_name="test-trace",
+                active_fetch_parent_observation_id="parent-obs-1",
+            )
+
+    assert result["llm_answer"] == "final answer"
+    assert result["fetch_count"] == 1
+
+    # start_observation: iteration_1 LLM + iteration_1 fetch + iteration_2 LLM (stop)
+    assert langfuse_client.start_observation.call_count == 3
+
+    # Inspect each call
+    calls = langfuse_client.start_observation.call_args_list
+
+    # First call: iteration_1 LLM generation
+    assert calls[0][1]["name"] == "active_fetch.iteration_1.llm"
+    assert calls[0][1]["as_type"] == "generation"
+    # input captures messages reference (mutated in later loop iterations)
+    assert calls[0][1]["input"]["messages"][0] == {"role": "user", "content": "test q"}
+    assert calls[0][1]["metadata"]["parent_observation_id"] == "parent-obs-1"
+    assert calls[0][1]["metadata"]["active_fetch_trace_name"] == "test-trace"
+    assert calls[0][1]["metadata"]["iteration"] == 1
+
+    # Second call: iteration_1 fetch_materials span
+    assert calls[1][1]["name"] == "active_fetch.iteration_1.fetch_materials"
+    assert calls[1][1]["as_type"] == "span"
+    assert calls[1][1]["input"]["query"] == "test"
+    assert calls[1][1]["input"]["top_k"] == 3
+    assert calls[1][1]["input"]["tool_call_id"] == "tc1"
+    assert calls[1][1]["metadata"]["parent_observation_id"] == "parent-obs-1"
+    assert calls[1][1]["metadata"]["active_fetch_trace_name"] == "test-trace"
+    assert calls[1][1]["metadata"]["iteration"] == 1
+
+    # Third call: iteration_2 LLM generation (stop response - still traced)
+    assert calls[2][1]["name"] == "active_fetch.iteration_2.llm"
+    assert calls[2][1]["as_type"] == "generation"
+    assert calls[2][1]["metadata"]["iteration"] == 2
+
+
+async def test_active_fetch_langfuse_none_no_crash():
+    sample = EvalSample(question="test q", context="", expected_answer="test a")
+
+    tool_calls_response = {
+        "choices": [{
+            "finish_reason": "tool_calls",
+            "message": {
+                "tool_calls": [{
+                    "id": "tc1",
+                    "type": "function",
+                    "function": {
+                        "name": "fetch_materials",
+                        "arguments": '{"query": "test", "top_k": 3}',
+                    },
+                }],
+            },
+        }]
+    }
+    stop_response = {
+        "choices": [{
+            "finish_reason": "stop",
+            "message": {"content": "final answer"},
+        }]
+    }
+
+    mock_fetch_result = FetchResult(
+        doc_id="doc1", title="t", passage="p", score=1.0, path=Path("/tmp/d"),
+    )
+
+    with patch("eval.evaluator.call_llm_messages", new_callable=AsyncMock) as mock_llm:
+        mock_llm.side_effect = [tool_calls_response, stop_response]
+        with patch("eval.evaluator.fetch_materials", return_value=[mock_fetch_result]):
+            result = await evaluate_sample_active_fetch(
+                sample, 0,
+                llm_endpoint="http://test",
+                langfuse_client=None,
+                suppress_backend_langfuse=True,
+            )
+
+    assert result["llm_answer"] == "final answer"
+    assert result["fetch_count"] == 1
+    assert result["fetched_doc_ids"] == ["doc1"]
+    assert result["loop_terminated_early"] is False
+
+    # Verify skip header was passed in both calls
+    assert mock_llm.call_count == 2
+    for call_args in mock_llm.call_args_list:
+        assert call_args[1]["extra_headers"] == {"X-Skip-Langfuse": "true"}
+
+
+async def test_active_fetch_no_tool_call_still_traced():
+    sample = EvalSample(question="direct answer q", context="", expected_answer="direct a")
+
+    stop_response = {
+        "choices": [{
+            "finish_reason": "stop",
+            "message": {"content": "direct answer"},
+        }]
+    }
+
+    langfuse_client = MagicMock()
+    obs_mock = MagicMock()
+    obs_mock.id = "obs-001"
+    langfuse_client.start_observation.return_value = obs_mock
+
+    with patch("eval.evaluator.call_llm_messages", new_callable=AsyncMock) as mock_llm:
+        mock_llm.side_effect = [stop_response]
+        with patch("eval.evaluator.fetch_materials") as mock_fetch:
+            result = await evaluate_sample_active_fetch(
+                sample, 0,
+                llm_endpoint="http://test",
+                langfuse_client=langfuse_client,
+                active_fetch_trace_name="test-trace",
+                active_fetch_parent_observation_id="parent-obs-1",
+            )
+
+    assert result["llm_answer"] == "direct answer"
+    assert result["fetch_count"] == 0
+    mock_fetch.assert_not_called()
+
+    # At least one LLM observation was created
+    assert langfuse_client.start_observation.call_count == 1
+    calls = langfuse_client.start_observation.call_args_list
+    assert calls[0][1]["name"] == "active_fetch.iteration_1.llm"
+    assert calls[0][1]["as_type"] == "generation"
+
+    # No fetch observation since there were no tool calls
+    obs_mock.update.assert_called_once()
+    obs_mock.end.assert_called_once()

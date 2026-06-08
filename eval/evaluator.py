@@ -543,6 +543,70 @@ async def evaluate_sample(
     return sample_result
 
 
+# ---------------------------------------------------------------------------
+# Safe Langfuse observation helpers for active-fetch tracing
+# ---------------------------------------------------------------------------
+
+
+def _start_active_fetch_observation(
+    langfuse_client: Any,
+    name: str,
+    as_type: str,
+    input_data: dict[str, Any],
+    metadata: dict[str, Any],
+) -> Any | None:
+    """Start a Langfuse observation (generation or span), returning the observation or None on failure."""
+    try:
+        return langfuse_client.start_observation(
+            name=name,
+            as_type=as_type,
+            input=input_data,
+            metadata=metadata,
+        )
+    except Exception as exc:
+        logger.warning("Failed to start Langfuse observation %s: %s", name, exc)
+        return None
+
+
+def _safe_update_observation(
+    observation: Any,
+    output: dict[str, Any] | None = None,
+    usage_details: dict[str, Any] | None = None,
+    metadata: dict[str, Any] | None = None,
+) -> None:
+    """Update a Langfuse observation without raising."""
+    if observation is None:
+        return
+    try:
+        kwargs: dict[str, Any] = {}
+        if output is not None:
+            kwargs["output"] = output
+        if usage_details is not None:
+            kwargs["usage_details"] = usage_details
+        if metadata is not None:
+            kwargs["metadata"] = metadata
+        if kwargs:
+            observation.update(**kwargs)
+    except Exception as exc:
+        logger.warning("Failed to update Langfuse observation: %s", exc)
+
+
+def _safe_end_observation(
+    observation: Any,
+    end_time: int | None = None,
+) -> None:
+    """End a Langfuse observation without raising."""
+    if observation is None:
+        return
+    try:
+        kwargs: dict[str, Any] = {}
+        if end_time is not None:
+            kwargs["end_time"] = end_time
+        observation.end(**kwargs)
+    except Exception as exc:
+        logger.warning("Failed to end Langfuse observation: %s", exc)
+
+
 async def evaluate_sample_active_fetch(
     sample: EvalSample,
     sample_index: int,
@@ -552,6 +616,10 @@ async def evaluate_sample_active_fetch(
     semaphore: asyncio.Semaphore | None = None,
     request_timeout: float = DEFAULT_LLM_TIMEOUT_SECONDS,
     corpus_dir: Path | None = None,
+    langfuse_client: Any | None = None,
+    active_fetch_trace_name: str | None = None,
+    active_fetch_parent_observation_id: str | None = None,
+    suppress_backend_langfuse: bool = False,
 ) -> dict[str, Any]:
     """Evaluate a sample using active fetch — the model fetches its own materials via tool calls."""
     if corpus_dir is None:
@@ -570,16 +638,60 @@ async def evaluate_sample_active_fetch(
     loop_terminated_early: bool = False
     final_answer: str = ""
 
+    _has_trace = (
+        langfuse_client is not None
+        and active_fetch_trace_name is not None
+        and active_fetch_parent_observation_id is not None
+    )
+
     for iteration in range(MAX_TOOL_ITERATIONS):
+        # ---- LLM observation start ----
+        llm_obs: Any = None
+        if _has_trace:
+            llm_obs = _start_active_fetch_observation(
+                langfuse_client,
+                name=f"active_fetch.iteration_{iteration + 1}.llm",
+                as_type="generation",
+                input_data={"messages": messages},
+                metadata={
+                    "parent_observation_id": active_fetch_parent_observation_id,
+                    "active_fetch_trace_name": active_fetch_trace_name,
+                    "iteration": iteration + 1,
+                },
+            )
+
         async with semaphore:
-            response = await call_llm_messages(
-                messages,
+            llm_kwargs: dict[str, Any] = dict(
+                messages=messages,
                 endpoint=llm_endpoint,
                 model=model,
                 max_tokens=EVALUATION_MAX_TOKENS,
                 timeout=request_timeout,
                 tools=[FETCH_MATERIALS_TOOL],
             )
+            if suppress_backend_langfuse:
+                llm_kwargs["extra_headers"] = {"X-Skip-Langfuse": "true"}
+            response = await call_llm_messages(**llm_kwargs)
+
+        # ---- LLM observation update / end ----
+        if llm_obs is not None:
+            choices_for_obs = response.get("choices", [])
+            if choices_for_obs:
+                msg = choices_for_obs[0].get("message", {})
+                _safe_update_observation(
+                    llm_obs,
+                    output={
+                        "content": msg.get("content", ""),
+                        "tool_calls": msg.get("tool_calls"),
+                    },
+                    usage_details=(
+                        _usage_details_from_payload(response.get("usage") or {})
+                        if response.get("usage")
+                        else None
+                    ),
+                    metadata={"active_fetch_trace_name": active_fetch_trace_name},
+                )
+            _safe_end_observation(llm_obs)
 
         choices = response.get("choices", [])
         if not choices:
@@ -623,6 +735,21 @@ async def evaluate_sample_active_fetch(
                     top_k = 3
                 top_k = min(top_k, 5)
 
+                # ---- Fetch observation start ----
+                fetch_obs: Any = None
+                if _has_trace:
+                    fetch_obs = _start_active_fetch_observation(
+                        langfuse_client,
+                        name=f"active_fetch.iteration_{iteration + 1}.fetch_materials",
+                        as_type="span",
+                        input_data={"query": query, "top_k": top_k, "tool_call_id": tc_id},
+                        metadata={
+                            "parent_observation_id": active_fetch_parent_observation_id,
+                            "active_fetch_trace_name": active_fetch_trace_name,
+                            "iteration": iteration + 1,
+                        },
+                    )
+
                 results = fetch_materials(query, top_k, corpus_dir)
 
                 fetch_count += 1
@@ -631,6 +758,19 @@ async def evaluate_sample_active_fetch(
                     if fetched_text:
                         fetched_text += "\n\n"
                     fetched_text += r.passage
+
+                # ---- Fetch observation update / end ----
+                if fetch_obs is not None:
+                    _safe_update_observation(
+                        fetch_obs,
+                        output={
+                            "doc_ids": [r.doc_id for r in results],
+                            "count": len(results),
+                            "snippets": [r.passage[:200] for r in results],
+                        },
+                        metadata={"active_fetch_trace_name": active_fetch_trace_name},
+                    )
+                    _safe_end_observation(fetch_obs)
 
                 serialized = [
                     {
