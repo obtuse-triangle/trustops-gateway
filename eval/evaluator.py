@@ -282,7 +282,7 @@ async def check_tool_call_capability(
             max_tokens=100,
             timeout=timeout,
             tools=[FETCH_MATERIALS_TOOL],
-            tool_choice={"type": "function", "function": {"name": "fetch_materials"}},
+            tool_choice="auto",
         )
         choices = result.get("choices", [])
         if not choices:
