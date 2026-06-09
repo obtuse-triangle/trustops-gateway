@@ -279,7 +279,7 @@ async def check_tool_call_capability(
             test_messages,
             endpoint=endpoint,
             model=model,
-            max_tokens=100,
+            max_tokens=500,
             timeout=timeout,
             tools=[FETCH_MATERIALS_TOOL],
             tool_choice="auto",
@@ -291,7 +291,8 @@ async def check_tool_call_capability(
                 "The active_fetch mode requires an endpoint that supports OpenAI-compatible tool calling."
             )
         msg = choices[0].get("message", {})
-        if not msg.get("tool_calls"):
+        finish = choices[0].get("finish_reason", "")
+        if not msg.get("tool_calls") and finish != "length":
             raise RuntimeError(
                 "Tool calling not supported by this model endpoint. "
                 "The active_fetch mode requires the model to respond with tool_calls "
