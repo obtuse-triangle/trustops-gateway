@@ -61,6 +61,7 @@ async def deploy(request: Request) -> dict:
 
 @router.get("/")
 async def root(request: Request) -> dict[str, str]:
+  settings = get_settings(request)
   return {"message": "trustOpsBack vLLM gateway", "upstream": settings.vllm_base_url}
 
 

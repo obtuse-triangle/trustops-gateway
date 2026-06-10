@@ -718,7 +718,6 @@ async def evaluate_sample_active_fetch(
 
         choice = choices[0]
         message = choice.get("message", {})
-        finish_reason = choice.get("finish_reason", "")
         tool_calls = message.get("tool_calls")
 
         if not tool_calls:
