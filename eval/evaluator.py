@@ -1232,7 +1232,7 @@ def push_scores_to_langfuse(
                 "evaluator": "trustops-eval",
             },
         )
-        trace_id = trace.id
+        trace_id = trace.trace_id
         trace.update(output={"answer": sample.llm_answer})
         trace.end()
 
